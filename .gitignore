@@ -1,0 +1,26 @@
+# ── SECRETS — never commit ──────────────────────────────
+.env
+.env.*
+!.env.example
+*secret*
+*credentials*
+*.pem
+*.key
+
+# ── deploy/runtime junk ─────────────────────────────────
+*.log
+*.bak
+*.bak_*
+*.dmp
+*.sav
+*.verbackup
+__pycache__/
+*.pyc
+
+# ── large client payload (distribute via GitHub Releases, not git) ──
+payload/
+*.zip
+*.pak
+*.ucas
+*.utoc
+*.dll
