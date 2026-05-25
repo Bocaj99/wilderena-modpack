@@ -6,6 +6,14 @@ Client modpack for **Wilderena**, a 3v3 Capture-the-Flag PvP mode for
 > This repo contains **only client-side code** — the VFX/UI receiver that runs on
 > your machine. All game logic runs server-side and is not distributed.
 
+## What's new
+
+- **v1.0.3** — Camera snaps when you join a class lobby (faces outward), spawn into the arena (faces the enemy), and enter a dungeon (faces the boss).
+- **v1.0.2** — Fixed the Abyss dungeon fire VFX not rendering for the 2nd player (now lights up per-player, faster).
+- **v1.0.1** — Build menu disabled during play (admins toggle with `!builder`).
+
+*Server-side changes (live for everyone automatically — no download needed):* mob loot drops disabled · 2× larger mob weak-points (easier headshots) · 2× larger bosses · per-class runes fixed (no cross-element runes) · archer arrows upgrade with weapon tier · buildings auto-repair.
+
 ## Install (easy — full modpack)
 
 1. Download **`WilderenaModpack.zip`** from the [latest Release](../../releases/latest).
