@@ -944,6 +944,37 @@ local function register_mc_event_hook()
                                 game_state.builder_allowed = false
                                 print("[WilderenaClient] Builder DISABLED by admin\n")
                             end
+
+                        elseif etype == "camsnap" then
+                            -- Server asks us to snap the LOCAL player's camera to a yaw.
+                            -- Must be client-side: the client owns its control rotation,
+                            -- so a server SetControlRotation gets overridden. Broadcast to
+                            -- all clients; we filter to our own pawn by PlayerId.
+                            local target_pid = tonumber(parts[2])
+                            local snap_yaw = tonumber(parts[3])
+                            if target_pid and snap_yaw then
+                                ExecuteInGameThread(function()
+                                    pcall(function()
+                                        local pcs = FindAllOf("BP_PlayerCharacter_C")
+                                        if not pcs then return end
+                                        for _, pc in pairs(pcs) do
+                                            pcall(function()
+                                                if not pc or not pc:IsValid() then return end
+                                                local is_local = false
+                                                local called = pcall(function() is_local = pc:IsLocallyControlled() end)
+                                                if called and not is_local then return end
+                                                local c = pc:GetInstigatorController() or pc:GetController()
+                                                if not c or not c:IsValid() then return end
+                                                local mypid = nil
+                                                pcall(function() mypid = c.PlayerState.PlayerId end)
+                                                if mypid ~= target_pid then return end
+                                                c:SetControlRotation({Pitch = 0, Yaw = snap_yaw, Roll = 0})
+                                                print(string.format("[WilderenaClient] camsnap -> yaw=%d\n", snap_yaw))
+                                            end)
+                                        end
+                                    end)
+                                end)
+                            end
                         end
                     end)
                 end)
