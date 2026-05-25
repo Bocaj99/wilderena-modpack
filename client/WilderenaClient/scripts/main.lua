@@ -1511,18 +1511,33 @@ local function _vfx_test_cycle(list, key, label)
     local folder = pkg:match("^(.*)/[^/]+$")
     local name = pkg:match("/([^/]+)$")
     local i, n = _vfx_test_idx[key], #list
-    ExecuteInGameThread(function()
-        pcall(function()
-            local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
-            if not p or not p:IsValid() then return end
-            local world = p:GetWorld()
-            local pos = p:K2_GetActorLocation()
-            local sp = { X = pos.X, Y = pos.Y, Z = pos.Z + 120 }
-            local comp = spawn_niagara_with_load(world, folder, name, sp, nil)
-            print(string.format("[VFX TEST] %s [%d/%d] %s -> %s\n", label, i, n, name, comp and "OK" or "FAIL"))
+    local done = false
+    -- Niagara assets may stream in async, so retry the load+spawn across a few delays.
+    for _, d in ipairs({ 0, 500, 1200, 2200 }) do
+        ExecuteWithDelay(d, function()
+            if done then return end
+            ExecuteInGameThread(function()
+                if done then return end
+                local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
+                if not p or not p:IsValid() then return end
+                local world = p:GetWorld()
+                local pos = p:K2_GetActorLocation()
+                local sp = { X = pos.X, Y = pos.Y, Z = pos.Z + 120 }
+                local comp = spawn_niagara_with_load(world, folder, name, sp, nil)
+                if comp then
+                    done = true
+                    print(string.format("[VFX TEST] %s [%d/%d] %s -> OK (%dms)
+", label, i, n, name, d))
+                end
+            end)
         end)
+    end
+    ExecuteWithDelay(2700, function()
+        if not done then print(string.format("[VFX TEST] %s [%d/%d] %s -> FAIL (not loadable here)
+", label, i, n, name)) end
     end)
 end
+
 RegisterKeyBind(Key.NUM_FOUR, function() _vfx_test_cycle(_VFX_TEST_FELLHOLLOW, "fell", "Fellhollow") end)
 RegisterKeyBind(Key.NUM_FIVE, function() _vfx_test_cycle(_VFX_TEST_DOWDUN, "dow", "DowdunReach") end)
 
