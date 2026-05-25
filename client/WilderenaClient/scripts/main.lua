@@ -662,7 +662,7 @@ local game_state = {
     blue_torches = 0,
     players = {},             -- [slot] = {name, class, kills, deaths, flags}
     winner = nil,
-    builder_allowed = true,  -- LOCAL DEV: always allow building (dungeon authoring)
+    builder_allowed = false,  -- shipped modpack: building BLOCKED by default; F9 (or admin "builder|enable") re-allows for dungeon authoring
 }
 
 -- ============================================================================
@@ -1218,6 +1218,53 @@ local function try_register_respawn_hook()
 end
 
 -- ============================================================================
+-- BUILD BLOCKER (client-side)
+-- When builder_allowed is false, kick the LOCAL player out of build mode so the
+-- B tab can't be used. Reactive (<= loop interval) — the tab may flash briefly
+-- before closing; a frame-perfect block would need a hook on the build-enter fn.
+-- Default is BLOCKED; press F9 (or send admin "builder|enable") to allow building
+-- for dungeon authoring.
+-- ============================================================================
+local _bb_local_pawn = nil
+local function _bb_get_local_pawn()
+    local ok = false
+    pcall(function() ok = _bb_local_pawn and _bb_local_pawn:IsValid() end)
+    if ok then return _bb_local_pawn end
+    _bb_local_pawn = nil
+    local players = FindAllOf("BP_PlayerCharacter_C")
+    if not players then return nil end
+    for _, p in pairs(players) do
+        local is_local = false
+        local called = pcall(function() is_local = p:IsLocallyControlled() end)
+        if (not called) or is_local then  -- if IsLocallyControlled unavailable, assume local (client has 1 controllable pawn)
+            local valid = false
+            pcall(function() valid = p and p:IsValid() end)
+            if valid then _bb_local_pawn = p; return p end
+        end
+    end
+    return nil
+end
+
+local function enforce_build_block()
+    if game_state.builder_allowed then return end
+    local p = _bb_get_local_pawn()
+    if not p then return end
+    pcall(function()
+        local ctrl = p:GetInstigatorController()
+        if not ctrl or not ctrl:IsValid() then return end
+        local bmc = ctrl.BuildModeComponent
+        if not bmc or not bmc:IsValid() then return end
+        local cur = 0
+        pcall(function() cur = bmc.CurrentBuildMode end)
+        if cur and cur ~= 0 then
+            pcall(function() bmc:ExitAnyMode() end)
+            pcall(function() bmc:Server_SetBuildMode(0) end)
+            pcall(function() bmc.CurrentBuildMode = 0 end)
+        end
+    end)
+end
+
+-- ============================================================================
 -- SINGLE UNIFIED HOOK REGISTRATION RETRY LOOP
 -- One LoopAsync that tries all hooks, stops when all succeed.
 -- ============================================================================
@@ -1231,8 +1278,12 @@ LoopAsync(2000, function()
     if all_done then
         print("[WilderenaClient] All hooks registered\n")
 
-        -- Build blocker DISABLED on local install (dungeon authoring mode)
-        print("[WilderenaClient] Build blocker DISABLED (local dev build)\n")
+        -- Build blocker (client-side): enforce whenever builder_allowed is false.
+        LoopAsync(150, function()
+            pcall(enforce_build_block)
+            return false  -- run for the whole session
+        end)
+        print(string.format("[WilderenaClient] Build blocker ENABLED (client-side, builder_allowed=%s; F9 toggles)\n", tostring(game_state.builder_allowed)))
 
         -- Pin Niagara assets now that world is confirmed valid
         -- Stagger 3 attempts (2s, 7s, 12s after hooks) to catch late-streaming assets
@@ -1254,6 +1305,12 @@ end)
 -- ============================================================================
 -- KEYBINDS
 -- ============================================================================
+
+-- F9 = toggle build permission (for dungeon authoring). Default is BLOCKED.
+RegisterKeyBind(Key.F9, function()
+    game_state.builder_allowed = not game_state.builder_allowed
+    print(string.format("[WilderenaClient] builder_allowed -> %s (F9)\n", tostring(game_state.builder_allowed)))
+end)
 
 -- F3 = Test spawn red + blue standing torches at flag positions
 RegisterKeyBind(Key.F3, function()
