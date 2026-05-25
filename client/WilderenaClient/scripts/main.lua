@@ -2159,7 +2159,10 @@ local function _activate_abyss_fires()
     if not world then return end
     local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
     if not nflib then return end
-    if not _abyss_load_systems() then return end
+    if not _abyss_load_systems() then
+        print("[WilderenaClient] Abyss Fire Zone: systems NOT loaded (NS_Fire_Big_2 missing) - fires skipped\n")
+        return
+    end
 
     local big_sys = _abyss_nia_systems.big
     local count = 0
@@ -2265,14 +2268,17 @@ end)
 -- Z-gated: player must be BELOW arena floor (Z < -1000) AND within XY radius.
 -- Arena is directly above Abyss, so 3D distance check would falsely include arena.
 -- Also gated on _wilderena_active so we never even poll on offline/non-Wilderena servers.
-LoopAsync(2000, function()
+LoopAsync(1000, function()
     if not _wilderena_active then
         if _abyss_active then ExecuteInGameThread(function() pcall(_deactivate_abyss_fires) end) end
         return false
     end
     ExecuteInGameThread(function()
         pcall(function()
-            local p = FindFirstOf("BP_PlayerCharacter_C")
+            -- LOCAL player only — FindFirstOf can return a REMOTE pawn in multiplayer,
+            -- which made the abyss gate test the wrong player (fires didn't activate for
+            -- the 2nd player / appeared delayed). Reuse the local-pawn getter.
+            local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
             if not p or not p:IsValid() then return end
             local loc = p:K2_GetActorLocation()
             local in_abyss = false
