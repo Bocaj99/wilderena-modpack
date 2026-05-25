@@ -1538,8 +1538,8 @@ local function _vfx_test_cycle(list, key, label)
     end)
 end
 
-RegisterKeyBind(Key.NUM_EIGHT, function() _vfx_test_cycle(_VFX_TEST_FELLHOLLOW, "fell", "Fellhollow") end)
-RegisterKeyBind(Key.NUM_NINE, function() _vfx_test_cycle(_VFX_TEST_DOWDUN, "dow", "DowdunReach") end)
+RegisterKeyBind(Key.EIGHT, function() _vfx_test_cycle(_VFX_TEST_FELLHOLLOW, "fell", "Fellhollow") end)
+RegisterKeyBind(Key.NINE, function() _vfx_test_cycle(_VFX_TEST_DOWDUN, "dow", "DowdunReach") end)
 
 -- F9 = toggle build permission (for dungeon authoring). Default is BLOCKED.
 RegisterKeyBind(Key.F9, function()
