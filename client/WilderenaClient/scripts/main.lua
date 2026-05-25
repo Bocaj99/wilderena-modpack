@@ -1537,42 +1537,60 @@ local function _vfx_test_cycle(list, key, label)
 end
 
 -- ============================================================================
--- FOG TEST (key 7): toggle a swamp-style LocalFogVolume at the player.
--- ALocalFogVolume is an ENGINE class -> spawnable anywhere, no asset load needed.
--- This is the same mechanism the Whispering Swamps uses (Local Fog V2). Tune the
--- values below by eye, like the beam/torch calibration.
+-- FOG STYLE CYCLER (key 7): each press removes the previous fog and spawns the
+-- next style at the player, logging its name -> compare looks. LocalFogVolume is
+-- the engine volumetric (area = actor scale); the rest are the game's own fog
+-- Blueprints. To size to a specific area, give coords and we set position+scale.
 -- ============================================================================
-local _fog_test_actor = nil
+local _fog_styles = {
+    { name = "LocalFogVolume (swamp preset)", engine = true },
+    { name = "DistantOpaqueFog_Toxic",  path = "/Game/Gameplay/World/Ambience/Components/BP_DistantOpaqueFog_Toxic.BP_DistantOpaqueFog_Toxic_C" },
+    { name = "DistantOpaqueFog",        path = "/Game/Gameplay/World/Ambience/Components/BP_DistantOpaqueFog.BP_DistantOpaqueFog_C" },
+    { name = "GroundFog_v03",           path = "/Game/Art/Env/Lighting/BPs/BP_GroundFog_v03.BP_GroundFog_v03_C" },
+    { name = "GroundFog_Plane",         path = "/Game/Art/Env/Lighting/BPs/BP_GroundFog_Plane.BP_GroundFog_Plane_C" },
+    { name = "HeightFog_FH (Fellhollow)", path = "/Game/Art/Env/Lighting/BP_HeightFog_FH.BP_HeightFog_FH_C" },
+    { name = "HeightFog (base)",        path = "/Game/Art/Env/Lighting/BP_HeightFog.BP_HeightFog_C" },
+    { name = "Nexus_Fog",               path = "/Game/Art/Env/Lighting/BP_Nexus_Fog.BP_Nexus_Fog_C" },
+    { name = "DistanceFog_plane_01",    path = "/Game/Art/Env/Lighting/BPs/BP_DistanceFog_plane_01.BP_DistanceFog_plane_01_C" },
+}
+local _fog_idx = 0
+local _fog_actor = nil
 RegisterKeyBind(Key.SEVEN, function()
     ExecuteInGameThread(function()
         pcall(function()
-            if _fog_test_actor and _fog_test_actor:IsValid() then
-                pcall(function() _fog_test_actor:K2_DestroyActor() end)
-                _fog_test_actor = nil
-                print("[FOG TEST] swamp fog REMOVED" .. string.char(10))
-                return
-            end
+            if _fog_actor and _fog_actor:IsValid() then pcall(function() _fog_actor:K2_DestroyActor() end) end
+            _fog_actor = nil
+            _fog_idx = (_fog_idx % #_fog_styles) + 1
+            local style = _fog_styles[_fog_idx]
             local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
             if not p or not p:IsValid() then return end
             local world = p:GetWorld()
             local pos = p:K2_GetActorLocation()
-            local cls = StaticFindObject("/Script/Engine.LocalFogVolume")
-            if not cls then print("[FOG TEST] LocalFogVolume class not found" .. string.char(10)); return end
-            local a = world:SpawnActor(cls, { X = pos.X, Y = pos.Y, Z = pos.Z - 50 }, {})
-            if not a or not a:IsValid() then print("[FOG TEST] spawn FAILED" .. string.char(10)); return end
-            _fog_test_actor = a
-            pcall(function() a:SetActorScale3D({ X = 40.0, Y = 40.0, Z = 8.0 }) end)  -- volume size
-            local comp = a.LocalFogVolumeVolume
-            if comp and comp:IsValid() then
-                pcall(function() comp:SetRadialFogExtinction(1.0) end)
-                pcall(function() comp:SetHeightFogExtinction(3.0) end)   -- density
-                pcall(function() comp:SetHeightFogFalloff(0.5) end)
-                pcall(function() comp:SetHeightFogOffset(0.0) end)
-                pcall(function() comp:SetFogPhaseG(0.2) end)
-                pcall(function() comp:SetFogAlbedo({ R = 0.42, G = 0.5, B = 0.4, A = 1.0 }) end)   -- murky green
-                pcall(function() comp:SetFogEmissive({ R = 0.03, G = 0.05, B = 0.04, A = 1.0 }) end)
+            local sp = { X = pos.X, Y = pos.Y, Z = pos.Z - 50 }
+            local cls = nil
+            if style.engine then
+                cls = StaticFindObject("/Script/Engine.LocalFogVolume")
+            else
+                cls = StaticFindObject(style.path)
+                if not cls then
+                    pcall(function() LoadAsset((style.path:gsub("%.[^.]*$", ""))) end)
+                    cls = StaticFindObject(style.path)
+                end
             end
-            print("[FOG TEST] swamp LocalFogVolume spawned (press 7 again to remove)" .. string.char(10))
+            if not cls then print("[FOG STYLE] " .. _fog_idx .. "/" .. #_fog_styles .. " " .. style.name .. " -> class NOT FOUND" .. string.char(10)); return end
+            local a = world:SpawnActor(cls, sp, {})
+            if not a or not a:IsValid() then print("[FOG STYLE] " .. style.name .. " -> spawn FAILED" .. string.char(10)); return end
+            _fog_actor = a
+            if style.engine then
+                pcall(function() a:SetActorScale3D({ X = 40.0, Y = 40.0, Z = 8.0 }) end)
+                local comp = a.LocalFogVolumeVolume
+                if comp and comp:IsValid() then
+                    pcall(function() comp:SetHeightFogExtinction(3.0) end)
+                    pcall(function() comp:SetHeightFogFalloff(0.5) end)
+                    pcall(function() comp:SetFogAlbedo({ R = 0.42, G = 0.5, B = 0.4, A = 1.0 }) end)
+                end
+            end
+            print("[FOG STYLE] " .. _fog_idx .. "/" .. #_fog_styles .. " " .. style.name .. " -> OK" .. string.char(10))
         end)
     end)
 end)
