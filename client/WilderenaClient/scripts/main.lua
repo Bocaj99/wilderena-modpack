@@ -1526,15 +1526,13 @@ local function _vfx_test_cycle(list, key, label)
                 local comp = spawn_niagara_with_load(world, folder, name, sp, nil)
                 if comp then
                     done = true
-                    print(string.format("[VFX TEST] %s [%d/%d] %s -> OK (%dms)
-", label, i, n, name, d))
+                    print(string.format("[VFX TEST] %s [%d/%d] %s -> OK (%dms)", label, i, n, name, d) .. string.char(10))
                 end
             end)
         end)
     end
     ExecuteWithDelay(2700, function()
-        if not done then print(string.format("[VFX TEST] %s [%d/%d] %s -> FAIL (not loadable here)
-", label, i, n, name)) end
+        if not done then print(string.format("[VFX TEST] %s [%d/%d] %s -> FAIL (not loadable here)", label, i, n, name) .. string.char(10)) end
     end)
 end
 
