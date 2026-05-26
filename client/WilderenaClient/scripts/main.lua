@@ -2271,10 +2271,10 @@ print("[WilderenaClient] Loaded — event-driven architecture, CapsLock=scoreboa
 -- No background load when not in dungeon → eliminates death-window crash race.
 -- =============================================================================
 local abyss_fire_coords = {
-    -- 4 big fires only: two on each side (high-X and low-X), none in the middle.
-    -- Z lowered 100 (-2379 -> -2479).
-    {X=16757, Y=187286, Z=-2479}, {X=16050, Y=186861, Z=-2479},   -- right side
-    {X=13358, Y=188615, Z=-2479}, {X=13818, Y=189130, Z=-2479},   -- left side
+    -- 4 big fires, two on each side, spread to room corners so x14 fires don't merge.
+    -- Z lowered to -2779 (another -300).
+    {X=16750, Y=186600, Z=-2779}, {X=16750, Y=189200, Z=-2779},   -- right side
+    {X=13350, Y=186600, Z=-2779}, {X=13350, Y=189200, Z=-2779},   -- left side
 }
 local ABYSS_CENTROID = {X=15050, Y=187900, Z=-2379}
 -- Abyss is DIRECTLY BELOW the arena → can't use 3D distance (arena shares XY).
@@ -2480,12 +2480,12 @@ end
 local MANA = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_"
 local DFX = {
     [1] = { c = {X=16341,Y=186600}, zlo=-2700, zhi=-1000, rsq=3800*3800,
-            gate = {X=17640,Y=185280,Z=-1392}, gfx=MANA.."Fire",   gs=5.0, fog="light" },
+            gate = {X=17640,Y=185280,Z=-1392}, gfx=MANA.."Fire",   gs=2.5, fog="light" },
     [2] = { c = {X=6553,Y=187511},  zlo=-99999, zhi=-2700, rsq=3500*3500,
-            gate = {X=8148,Y=185855,Z=-3124},  gfx=MANA.."Nature", gs=5.0, fog="swamp",
+            gate = {X=8148,Y=185855,Z=-3124},  gfx=MANA.."Nature", gs=2.5, fog="swamp",
             boss = {X=4958,Y=189167,Z=-3516} },
     [3] = { c = {X=10756,Y=180712}, zlo=1000, zhi=99999, rsq=3500*3500,
-            gate = {X=12458,Y=178999,Z=1684},  gfx=MANA.."Air",    gs=5.0, fog="light" },
+            gate = {X=12458,Y=178999,Z=1684},  gfx=MANA.."Air",    gs=2.5, fog="light" },
 }
 local D2_ONCHAR = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_OnCharacter"
 local D2_BURST  = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_Burst"
