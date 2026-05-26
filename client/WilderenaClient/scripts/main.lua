@@ -2535,3 +2535,30 @@ LoopAsync(1000, function()
     end)
     return false
 end)
+
+
+-- ============================================================================
+-- KEY 6: scaled VFX cycler (mana-build colours x2 + big fire x6)
+-- Each press spawns the next at the player with its scale. Reuses _d2_spawn.
+-- ============================================================================
+local _k6_list = {
+    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Fire",   s = 2.0 },
+    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Nature", s = 2.0 },
+    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Air",    s = 2.0 },
+    { p = "/Game/Marketplace/Realistic_Pack/Niagara/Fire/NS_Fire_Big_2",      s = 6.0 },
+}
+local _k6_idx = 0
+RegisterKeyBind(Key.SIX, function()
+    ExecuteInGameThread(function()
+        pcall(function()
+            _k6_idx = (_k6_idx % #_k6_list) + 1
+            local e = _k6_list[_k6_idx]
+            local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
+            if not p or not p:IsValid() then return end
+            local w = p:GetWorld()
+            local pos = p:K2_GetActorLocation()
+            local comp = _d2_spawn(w, e.p, { X = pos.X, Y = pos.Y, Z = pos.Z + 50 }, e.s)
+            print("[K6 VFX] " .. _k6_idx .. "/" .. #_k6_list .. " " .. e.p:match("/([^/]+)$") .. " x" .. e.s .. " -> " .. (comp and "OK" or "FAIL") .. string.char(10))
+        end)
+    end)
+end)
