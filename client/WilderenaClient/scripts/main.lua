@@ -2542,10 +2542,10 @@ end)
 -- Each press spawns the next at the player with its scale. Reuses _d2_spawn.
 -- ============================================================================
 local _k6_list = {
-    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Fire",   s = 2.0 },
-    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Nature", s = 2.0 },
-    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Air",    s = 2.0 },
-    { p = "/Game/Marketplace/Realistic_Pack/Niagara/Fire/NS_Fire_Big_2",      s = 6.0 },
+    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Fire",   s = 5.0 },
+    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Nature", s = 5.0 },
+    { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Air",    s = 5.0 },
+    { p = "/Game/Marketplace/Realistic_Pack/Niagara/Fire/NS_Fire_Big_2",      s = 14.0 },
 }
 local _k6_idx = 0
 RegisterKeyBind(Key.SIX, function()
