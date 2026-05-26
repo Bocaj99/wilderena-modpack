@@ -2271,10 +2271,10 @@ print("[WilderenaClient] Loaded — event-driven architecture, CapsLock=scoreboa
 -- No background load when not in dungeon → eliminates death-window crash race.
 -- =============================================================================
 local abyss_fire_coords = {
-    -- 4 corners + 1 middle (5 big fires, 2 each side + center)
-    {X=16750, Y=186600, Z=-2779}, {X=16750, Y=189200, Z=-2779},   -- right side
-    {X=13350, Y=186600, Z=-2779}, {X=13350, Y=189200, Z=-2779},   -- left side
-    {X=15050, Y=187900, Z=-2779},                                  -- middle
+    -- 3 distinct big fires along the centroid Y, ~1700u apart on X (left / middle / right)
+    {X=13350, Y=187900, Z=-2779},   -- left
+    {X=15050, Y=187900, Z=-2779},   -- middle
+    {X=16750, Y=187900, Z=-2779},   -- right
 }
 local ABYSS_CENTROID = {X=15050, Y=187900, Z=-2379}
 -- Abyss is DIRECTLY BELOW the arena → can't use 3D distance (arena shares XY).
