@@ -2271,18 +2271,10 @@ print("[WilderenaClient] Loaded — event-driven architecture, CapsLock=scoreboa
 -- No background load when not in dungeon → eliminates death-window crash race.
 -- =============================================================================
 local abyss_fire_coords = {
-    -- Row 1
-    {X=16050, Y=186861, Z=-2379}, {X=15627, Y=187292, Z=-2379},
-    {X=15183, Y=187753, Z=-2379}, {X=14706, Y=188224, Z=-2379},
-    {X=14258, Y=188689, Z=-2379}, {X=13818, Y=189130, Z=-2379},
-    -- Row 2
-    {X=15691, Y=186265, Z=-2379}, {X=15224, Y=186735, Z=-2379},
-    {X=14758, Y=187205, Z=-2379}, {X=14291, Y=187675, Z=-2379},
-    {X=13825, Y=188145, Z=-2379}, {X=13358, Y=188615, Z=-2379},
-    -- Row 3
-    {X=16757, Y=187286, Z=-2379}, {X=16295, Y=187734, Z=-2379},
-    {X=15833, Y=188181, Z=-2379}, {X=15370, Y=188629, Z=-2379},
-    {X=14908, Y=189076, Z=-2379}, {X=14446, Y=189524, Z=-2379},
+    -- 4 big fires only: two on each side (high-X and low-X), none in the middle.
+    -- Z lowered 100 (-2379 -> -2479).
+    {X=16757, Y=187286, Z=-2479}, {X=16050, Y=186861, Z=-2479},   -- right side
+    {X=13358, Y=188615, Z=-2479}, {X=13818, Y=189130, Z=-2479},   -- left side
 }
 local ABYSS_CENTROID = {X=15050, Y=187900, Z=-2379}
 -- Abyss is DIRECTLY BELOW the arena → can't use 3D distance (arena shares XY).
@@ -2326,7 +2318,7 @@ local function _activate_abyss_fires()
     _abyss_fire_comps = {}
     for _, c in ipairs(abyss_fire_coords) do
         pcall(function()
-            local f = nflib:SpawnSystemAtLocation(world, big_sys, c, {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, false, true, 0, false)
+            local f = nflib:SpawnSystemAtLocation(world, big_sys, c, {Pitch=0,Yaw=0,Roll=0}, {X=14,Y=14,Z=14}, false, true, 0, false)
             if f then
                 count = count + 1
                 table.insert(_abyss_fire_comps, f)
@@ -2458,23 +2450,17 @@ end)
 
 
 -- ============================================================================
--- DUNGEON 2 (Zogre / Decayed Ruin) AMBIENCE  -- Fellhollow Imaru effects
--- Client-side, proximity-driven (like the Abyss fires). Dungeon 2 sits deep
--- (Z ~ -3124). On ENTRY: ImaruGaze_OnCharacter fires on the player. While
--- INSIDE: ImaruGaze_Burst + TowerSealBreak_Door spawn every ~1.5s near you.
--- Size is scaled by D2_FX_SCALE (tune to taste).
+-- DUNGEON FX SYSTEM (client, proximity-driven)
+--  * Gate marker: a mana-build loop at each dungeon TP-out point (D1=Fire,
+--    D2=Nature, D3=Air, x5).
+--  * Ambient fog: LocalFogVolume per dungeon -- D2 = swamp, D1/D3 = very light.
+--  * D2 entry: ImaruGaze_OnCharacter on the player.
+--  * D2 recurring (~1.5s): ImaruGaze_Burst + TowerSealBreak_Door spawned in the
+--    band between the Zogre (boss) spawn and the TP gateway.
+-- Proximity zones ESTIMATED from each dungeon destination<->boss midpoint
+-- (no authored perimeter) -- tune c/rsq/zlo/zhi if fog/markers land wrong.
 -- ============================================================================
-local D2_CENTER = { X = 6553, Y = 187511 }   -- midpoint of dungeon-2 destination + boss
-local D2_Z_MAX = -2700                        -- player below this (and in radius) = inside D2
-local D2_XY_RADIUS_SQ = 5000 * 5000
-local D2_FX_SCALE = 2.5                        -- effect size multiplier
-local D2_LOOP_MS = 1500                        -- recurring interval (~1-2s)
-local D2_ONCHAR = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_OnCharacter"
-local D2_BURST  = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_Burst"
-local D2_SEAL   = "/Game/Art/VFX/Library/Env/Fellhollow/ImaruSeal/NS_VFX_TowerSealBreak_Door"
-local _d2_active = false
-
-local function _d2_spawn(world, pkg, pos, scale)
+local function _d2_spawn(world, pkg, pos, scale)   -- scaled niagara spawn (also used by key 6)
     local name = pkg:match("/([^/]+)$")
     local full = pkg .. "." .. name
     local sys = _cached_niagara_sys[name]
@@ -2491,51 +2477,117 @@ local function _d2_spawn(world, pkg, pos, scale)
     return lib:SpawnSystemAtLocation(world, sys, pos, { Pitch = 0, Yaw = 0, Roll = 0 }, { X = s, Y = s, Z = s }, true, true, 0, false)
 end
 
--- recurring ambient (gated on _d2_active)
+local MANA = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_"
+local DFX = {
+    [1] = { c = {X=16341,Y=186600}, zlo=-2700, zhi=-1000, rsq=3800*3800,
+            gate = {X=17640,Y=185280,Z=-1392}, gfx=MANA.."Fire",   gs=5.0, fog="light" },
+    [2] = { c = {X=6553,Y=187511},  zlo=-99999, zhi=-2700, rsq=3500*3500,
+            gate = {X=8148,Y=185855,Z=-3124},  gfx=MANA.."Nature", gs=5.0, fog="swamp",
+            boss = {X=4958,Y=189167,Z=-3516} },
+    [3] = { c = {X=10756,Y=180712}, zlo=1000, zhi=99999, rsq=3500*3500,
+            gate = {X=12458,Y=178999,Z=1684},  gfx=MANA.."Air",    gs=5.0, fog="light" },
+}
+local D2_ONCHAR = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_OnCharacter"
+local D2_BURST  = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_Burst"
+local D2_SEAL   = "/Game/Art/VFX/Library/Env/Fellhollow/ImaruSeal/NS_VFX_TowerSealBreak_Door"
+local D2_FX_SCALE = 2.5
+local D2_LOOP_MS = 1500
+local FOG_SCALE = { X = 70.0, Y = 70.0, Z = 20.0 }   -- LocalFogVolume coverage (tune)
+
+local _dfx_cur = 0
+local _dfx_gate = nil
+local _dfx_fog = nil
+
+local function _dfx_spawn_fog(world, d)
+    local cls = StaticFindObject("/Script/Engine.LocalFogVolume")
+    if not cls then return nil end
+    local a = world:SpawnActor(cls, { X = d.c.X, Y = d.c.Y, Z = d.gate.Z }, {})
+    if not a or not a:IsValid() then return nil end
+    pcall(function() a:SetActorScale3D(FOG_SCALE) end)
+    local comp = a.LocalFogVolumeVolume
+    if comp and comp:IsValid() then
+        if d.fog == "swamp" then
+            pcall(function() comp:SetHeightFogExtinction(3.0) end)
+            pcall(function() comp:SetHeightFogFalloff(0.5) end)
+            pcall(function() comp:SetFogAlbedo({ R = 0.42, G = 0.5, B = 0.4, A = 1.0 }) end)
+        else
+            pcall(function() comp:SetHeightFogExtinction(0.4) end)
+            pcall(function() comp:SetHeightFogFalloff(0.8) end)
+            pcall(function() comp:SetFogAlbedo({ R = 0.7, G = 0.72, B = 0.78, A = 1.0 }) end)
+        end
+    end
+    return a
+end
+
+local function _dfx_clear()
+    if _dfx_gate and _dfx_gate:IsValid() then
+        pcall(function() _dfx_gate:DeactivateImmediate() end)
+        pcall(function() _dfx_gate:DestroyComponent() end)
+    end
+    if _dfx_fog and _dfx_fog:IsValid() then pcall(function() _dfx_fog:K2_DestroyActor() end) end
+    _dfx_gate = nil
+    _dfx_fog = nil
+end
+
 LoopAsync(D2_LOOP_MS, function()
-    if _d2_active then
+    if _dfx_cur == 2 then
         ExecuteInGameThread(function()
             pcall(function()
+                local d = DFX[2]
                 local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
                 if not p or not p:IsValid() then return end
                 local w = p:GetWorld()
-                local pos = p:K2_GetActorLocation()
-                local function rnd() return (math.random() - 0.5) * 600 end
-                _d2_spawn(w, D2_BURST, { X = pos.X + rnd(), Y = pos.Y + rnd(), Z = pos.Z + 100 }, D2_FX_SCALE)
-                _d2_spawn(w, D2_SEAL,  { X = pos.X + rnd(), Y = pos.Y + rnd(), Z = pos.Z + 50 },  D2_FX_SCALE)
+                local g, b = d.gate, d.boss
+                local function pt()
+                    local t = math.random()
+                    return { X = b.X + (g.X - b.X) * t + (math.random()-0.5)*400,
+                             Y = b.Y + (g.Y - b.Y) * t + (math.random()-0.5)*400,
+                             Z = b.Z + (g.Z - b.Z) * t + 100 }
+                end
+                _d2_spawn(w, D2_BURST, pt(), D2_FX_SCALE)
+                _d2_spawn(w, D2_SEAL,  pt(), D2_FX_SCALE)
             end)
         end)
     end
     return false
 end)
 
--- proximity poll (1s): detect dungeon-2 entry/exit
 LoopAsync(1000, function()
-    if not _wilderena_active then return false end
+    if not _wilderena_active then
+        if _dfx_cur ~= 0 then ExecuteInGameThread(function() pcall(_dfx_clear) end); _dfx_cur = 0 end
+        return false
+    end
     ExecuteInGameThread(function()
         pcall(function()
             local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
             if not p or not p:IsValid() then return end
             local loc = p:K2_GetActorLocation()
-            local inside = false
-            if loc.Z < D2_Z_MAX then
-                local dx = loc.X - D2_CENTER.X
-                local dy = loc.Y - D2_CENTER.Y
-                if (dx * dx + dy * dy) < D2_XY_RADIUS_SQ then inside = true end
+            local now = 0
+            for n, d in pairs(DFX) do
+                if loc.Z > d.zlo and loc.Z < d.zhi then
+                    local dx = loc.X - d.c.X
+                    local dy = loc.Y - d.c.Y
+                    if (dx * dx + dy * dy) < d.rsq then now = n; break end
+                end
             end
-            if inside and not _d2_active then
-                _d2_active = true
-                _d2_spawn(p:GetWorld(), D2_ONCHAR, p:K2_GetActorLocation(), D2_FX_SCALE)
-                print("[WilderenaClient] Dungeon 2 ambience: ENTER" .. string.char(10))
-            elseif (not inside) and _d2_active then
-                _d2_active = false
-                print("[WilderenaClient] Dungeon 2 ambience: EXIT" .. string.char(10))
+            if now ~= _dfx_cur then
+                _dfx_clear()
+                _dfx_cur = now
+                if now ~= 0 then
+                    local d = DFX[now]
+                    local w = p:GetWorld()
+                    _dfx_gate = _d2_spawn(w, d.gfx, d.gate, d.gs)
+                    _dfx_fog = _dfx_spawn_fog(w, d)
+                    if now == 2 then _d2_spawn(w, D2_ONCHAR, p:K2_GetActorLocation(), D2_FX_SCALE) end
+                    print("[WilderenaClient] Dungeon FX: ENTER dungeon " .. now .. " (fog=" .. d.fog .. ")" .. string.char(10))
+                else
+                    print("[WilderenaClient] Dungeon FX: EXIT" .. string.char(10))
+                end
             end
         end)
     end)
     return false
 end)
-
 
 -- ============================================================================
 -- KEY 6: scaled VFX cycler (mana-build colours x2 + big fire x6)
