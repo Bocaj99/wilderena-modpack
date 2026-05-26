@@ -1260,6 +1260,7 @@ end
 -- for dungeon authoring.
 -- ============================================================================
 local _bb_local_pawn = nil
+local _bb_pawn_logged = false  -- one-time diagnostic on first cache hit
 local function _bb_get_local_pawn()
     local ok = false
     pcall(function() ok = _bb_local_pawn and _bb_local_pawn:IsValid() end)
@@ -1267,13 +1268,66 @@ local function _bb_get_local_pawn()
     _bb_local_pawn = nil
     local players = FindAllOf("BP_PlayerCharacter_C")
     if not players then return nil end
+
+    -- Method 1 (preferred): IsLocallyControlled on the pawn. Reliable when exposed.
     for _, p in pairs(players) do
         local is_local = false
-        local called = pcall(function() is_local = p:IsLocallyControlled() end)
-        if (not called) or is_local then  -- if IsLocallyControlled unavailable, assume local (client has 1 controllable pawn)
+        local ok1 = pcall(function() is_local = p:IsLocallyControlled() end)
+        if ok1 and is_local then
             local valid = false
             pcall(function() valid = p and p:IsValid() end)
-            if valid then _bb_local_pawn = p; return p end
+            if valid then
+                _bb_local_pawn = p
+                if not _bb_pawn_logged then
+                    _bb_pawn_logged = true
+                    pcall(function() print("[WilderenaClient] _bb_get_local_pawn: method=IsLocallyControlled name=" .. p:GetFullName() .. string.char(10)) end)
+                end
+                return p
+            end
+        end
+    end
+
+    -- Method 2 (multiplayer fallback): check the pawn's Controller. On a client,
+    -- only the local player's PlayerController returns IsLocalPlayerController()
+    -- = true. Remote proxies have null/remote controllers. This is more reliable
+    -- across UE versions than IsLocallyControlled on the Pawn directly, and the
+    -- prior "assume first pawn is local" fallback BROKE in multiplayer — could
+    -- return another player's remote proxy, causing the dungeon-VFX-not-firing-
+    -- for-2nd-player bug.
+    for _, p in pairs(players) do
+        local is_local = false
+        pcall(function()
+            local ctrl = p:GetController()
+            if ctrl and ctrl:IsValid() then
+                pcall(function() is_local = ctrl:IsLocalPlayerController() end)
+            end
+        end)
+        if is_local then
+            local valid = false
+            pcall(function() valid = p and p:IsValid() end)
+            if valid then
+                _bb_local_pawn = p
+                if not _bb_pawn_logged then
+                    _bb_pawn_logged = true
+                    pcall(function() print("[WilderenaClient] _bb_get_local_pawn: method=Ctrl.IsLocalPC name=" .. p:GetFullName() .. string.char(10)) end)
+                end
+                return p
+            end
+        end
+    end
+
+    -- Method 3 (last resort): first valid pawn. May be wrong in MP, but better
+    -- than nil. Logged loudly so we know we hit it.
+    for _, p in pairs(players) do
+        local valid = false
+        pcall(function() valid = p and p:IsValid() end)
+        if valid then
+            _bb_local_pawn = p
+            if not _bb_pawn_logged then
+                _bb_pawn_logged = true
+                pcall(function() print("[WilderenaClient] _bb_get_local_pawn: method=FIRST_PAWN_FALLBACK (UNRELIABLE in MP) name=" .. p:GetFullName() .. string.char(10)) end)
+            end
+            return p
         end
     end
     return nil
@@ -2228,6 +2282,29 @@ table.insert(CLASS_PRELOAD_PATHS, D .. "/Head/ITEM_Armour_T6_Head_BlueDragonhide
 table.insert(CLASS_PRELOAD_PATHS, D .. "/Body/ITEM_Armour_T6_Body_BlueDragonHide.ITEM_Armour_T6_Body_BlueDragonHide")
 table.insert(CLASS_PRELOAD_PATHS, D .. "/Legs/ITEM_Armour_T6_Legs_BlueDragonhide.ITEM_Armour_T6_Legs_BlueDragonhide")
 
+-- Abyssal Demon Niagara assets (Stage 3 — 2026-05-26). Three crashes today
+-- during D1 demon fights all preceded by `LogNiagara: StaticMesh data
+-- interface has no valid mesh` on the demon's NiagaraComponents — residency
+-- miss on the client. LoadAsset here at boot pulls the Niagara systems
+-- (and their StaticMesh dependencies via UE5 hard-ref) into memory before
+-- the demon spawns, eliminating the broken-DI render-thread fault.
+-- Paths extracted from server UE4SS_ObjectDump.txt (2026-05-26).
+local DEMON_VFX_PATHS = {
+    "/Game/Art/VFX/Library/Character/StatusEffect/AbyssalDemon/NS_AbyssalDemon_Bleed",
+    "/Game/Art/VFX/Library/Character/StatusEffect/AbyssalDemon/NS_AbyssalDemon_OnFire_Digi1",
+    "/Game/Art/VFX/Library/Character/StatusEffect/AbyssalDemon/NS_AbyssalDemon_Poison",
+    "/Game/Art/VFX/Library/Combat/Magic/MagicWeaponTrails/NS_Combat_Melee_Slash_Ribbon_Abyssal_Whip",
+    "/Game/Art/VFX/Library/Combat/Melee/AbyssalWhip/NS_AbyssalWhip_Blocker",
+    "/Game/Art/VFX/Library/Combat/Melee/AbyssalWhip/NS_AbyssalWhip_Burst",
+    "/Game/Art/VFX/Library/Combat/Melee/AbyssalWhip/NS_AbyssalWhip_Explosion",
+    "/Game/Art/VFX/Library/Combat/Melee/AbyssalWhip/NS_AbyssalWhip_Tracker",
+    "/Game/Art/VFX/Library/AbyssalDemonFX/Export/AbyssalOrb/NS_AbyssalDemon_Orb",
+    "/Game/Art/VFX/Library/AbyssalDemonFX/Export/AbyssalOrb/NS_AbyssalDemon_Orb_EnergyLoop",
+}
+for _, p in ipairs(DEMON_VFX_PATHS) do
+    table.insert(CLASS_PRELOAD_PATHS, p .. "." .. p:match("([^/]+)$"))
+end
+
 local function preload_class_assets()
     local total = #CLASS_PRELOAD_PATHS
     local loaded = 0
@@ -2275,13 +2352,27 @@ print("[WilderenaClient] Loaded — event-driven architecture, CapsLock=scoreboa
 -- No background load when not in dungeon → eliminates death-window crash race.
 -- =============================================================================
 local abyss_fire_coords = {
-    -- 3 fires stacked at the centre, on the TP-dest→boss-spawn axis (2026-05-26).
-    -- TP dest=(17640,185280,-1392), boss=(15042,187920,-1691). XY midpoint
-    -- (16341,186600) is also DFX[1].c. Stacking 3 at the same point gives a
-    -- triple-intensity central pyre that's straight on as you spawn in.
-    {X=16341, Y=186600, Z=-2779},
-    {X=16341, Y=186600, Z=-2779},
-    {X=16341, Y=186600, Z=-2779},
+    -- 3 big-fire positions (user-marked via !pos in-game 2026-05-26,
+    -- then dropped -400 -> -700 total per iterative feedback).
+    -- Z=-1679 (orig) -> -2079 (-400) -> -2379 (-300 more).
+    {X=14329, Y=188589, Z=-2379},
+    {X=15247, Y=187666, Z=-2379},
+    {X=16112, Y=186824, Z=-2379},
+}
+
+-- Legacy scatter positions (from initial-commit abyss_fire_coords). Wisps and
+-- fire-explosion ambient spawns pick a random one of these as base, then add
+-- the XY/Z jitter in _abyss_rand_pos. 9 points = good spread across the floor.
+local abyss_ambient_coords = {
+    {X=16050, Y=186861, Z=-2379},
+    {X=15183, Y=187753, Z=-2379},
+    {X=14258, Y=188689, Z=-2379},
+    {X=15691, Y=186265, Z=-2379},
+    {X=14758, Y=187205, Z=-2379},
+    {X=13825, Y=188145, Z=-2379},
+    {X=16757, Y=187286, Z=-2379},
+    {X=15833, Y=188181, Z=-2379},
+    {X=14908, Y=189076, Z=-2379},
 }
 local ABYSS_CENTROID = {X=15050, Y=187900, Z=-2379}
 -- Abyss is DIRECTLY BELOW the arena → can't use 3D distance (arena shares XY).
@@ -2313,7 +2404,7 @@ end
 
 local function _activate_abyss_fires()
     if _abyss_active then return end
-    local player = FindFirstOf("BP_PlayerCharacter_C")
+    local player = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
     if not player or not player:IsValid() then return end
     local world = player:GetWorld()
     if not world then return end
@@ -2340,6 +2431,28 @@ local function _activate_abyss_fires()
     print(string.format("[WilderenaClient] Abyss Fire Zone: ACTIVATED (%d/%d fires)\n", count, #abyss_fire_coords))
 end
 
+-- Ambient ring buffer + tracker MUST be declared BEFORE _deactivate_abyss_fires
+-- (which references _abyss_ambient_comps). Earlier the local was declared AFTER
+-- the function, so the name resolved to a nil global, ipairs(nil) threw, the
+-- outer pcall in the proximity poll swallowed it, and _abyss_active stayed
+-- true forever. Confirmed via "abyss exit pending miss=3 -> miss=1" cycle
+-- pattern in the client diagnostic 2026-05-26.
+local _abyss_ambient_comps = {}
+local MAX_AMBIENT_COMPS = 30
+local function _ambient_track(comp)
+    if not comp then return end
+    table.insert(_abyss_ambient_comps, comp)
+    while #_abyss_ambient_comps > MAX_AMBIENT_COMPS do
+        local oldest = table.remove(_abyss_ambient_comps, 1)
+        pcall(function()
+            if oldest and oldest:IsValid() then
+                pcall(function() oldest:DeactivateImmediate() end)
+                pcall(function() oldest:DestroyComponent() end)
+            end
+        end)
+    end
+end
+
 local function _deactivate_abyss_fires()
     if not _abyss_active then return end
     local destroyed = 0
@@ -2353,32 +2466,51 @@ local function _deactivate_abyss_fires()
         end)
     end
     _abyss_fire_comps = {}
+    -- Also tear down all ambient (wisp/explosion) components — they accumulate
+    -- under the per-spawn cap and need a clean sweep on dungeon exit.
+    local amb_destroyed = 0
+    for _, comp in ipairs(_abyss_ambient_comps) do
+        pcall(function()
+            if comp and comp:IsValid() then
+                pcall(function() comp:DeactivateImmediate() end)
+                pcall(function() comp:DestroyComponent() end)
+                amb_destroyed = amb_destroyed + 1
+            end
+        end)
+    end
+    _abyss_ambient_comps = {}
     _abyss_active = false
-    print(string.format("[WilderenaClient] Abyss Fire Zone: DEACTIVATED (%d destroyed)\n", destroyed))
+    print(string.format("[WilderenaClient] Abyss Fire Zone: DEACTIVATED (big=%d ambient=%d)%s",
+        destroyed, amb_destroyed, string.char(10)))
 end
 
 local function _abyss_rand_pos()
-    local base = abyss_fire_coords[math.random(#abyss_fire_coords)]
-    -- Wisp/explosion Z raised 2026-05-26 — was base.Z + 800..1200 (Z range
-    -- -1979..-1579, well below TP dest Z=-1392). New range base.Z + 1800..2200
-    -- (Z -979..-579) puts them at and above player eye-level for visibility.
-    return {X = base.X + (math.random()-0.5)*400, Y = base.Y + (math.random()-0.5)*400, Z = base.Z + 1800 + math.random()*400}
+    -- Wisps + fire-explosions scatter across the 9 legacy positions.
+    -- Base Z=-2379 floor; wisp Z bumped 1400..1800 above (final Z -979..-579)
+    -- — was +1800..2200, dropped 400u 2026-05-26 per user feedback.
+    local base = abyss_ambient_coords[math.random(#abyss_ambient_coords)]
+    return {X = base.X + (math.random()-0.5)*400, Y = base.Y + (math.random()-0.5)*400, Z = base.Z + 1400 + math.random()*400}
 end
 
--- Ambient loops — started once at module load, gated on _abyss_active
+-- Ambient loops — started once at module load, gated on _abyss_active.
+-- Removed then restored 2026-05-26. Component cap (_ambient_track,
+-- MAX_AMBIENT_COMPS=30) bounds Niagara churn to prevent MallocBinned2 on TP.
 LoopAsync(500, function()
     if _abyss_active then
         ExecuteInGameThread(function()
             pcall(function()
                 if not _abyss_active then return end
-                local p = FindFirstOf("BP_PlayerCharacter_C")
+                local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
                 if not p or not p:IsValid() then return end
                 local w = p:GetWorld()
                 if not w then return end
                 local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
                 local fs_sys = _abyss_nia_systems.fs
                 if not nflib or not fs_sys or not fs_sys:IsValid() then return end
-                for _ = 1, 3 do pcall(function() nflib:SpawnSystemAtLocation(w, fs_sys, _abyss_rand_pos(), {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, true, true, 0, false) end) end
+                for _ = 1, 3 do pcall(function()
+                    local c = nflib:SpawnSystemAtLocation(w, fs_sys, _abyss_rand_pos(), {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, true, true, 0, false)
+                    _ambient_track(c)
+                end) end
             end)
         end)
     end
@@ -2390,14 +2522,17 @@ LoopAsync(2000, function()
         ExecuteInGameThread(function()
             pcall(function()
                 if not _abyss_active then return end
-                local p = FindFirstOf("BP_PlayerCharacter_C")
+                local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
                 if not p or not p:IsValid() then return end
                 local w = p:GetWorld()
                 if not w then return end
                 local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
                 local i1 = _abyss_nia_systems.i1
                 if nflib and i1 and i1:IsValid() then
-                    pcall(function() nflib:SpawnSystemAtLocation(w, i1, _abyss_rand_pos(), {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, true, true, 0, false) end)
+                    pcall(function()
+                        local c = nflib:SpawnSystemAtLocation(w, i1, _abyss_rand_pos(), {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, true, true, 0, false)
+                        _ambient_track(c)
+                    end)
                 end
             end)
         end)
@@ -2411,14 +2546,17 @@ ExecuteWithDelay(1000, function()
             ExecuteInGameThread(function()
                 pcall(function()
                     if not _abyss_active then return end
-                    local p = FindFirstOf("BP_PlayerCharacter_C")
+                    local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
                     if not p or not p:IsValid() then return end
                     local w = p:GetWorld()
                     if not w then return end
                     local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
                     local i2 = _abyss_nia_systems.i2
                     if nflib and i2 and i2:IsValid() then
-                        pcall(function() nflib:SpawnSystemAtLocation(w, i2, _abyss_rand_pos(), {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, true, true, 0, false) end)
+                        pcall(function()
+                            local c = nflib:SpawnSystemAtLocation(w, i2, _abyss_rand_pos(), {Pitch=0,Yaw=0,Roll=0}, {X=1,Y=1,Z=1}, true, true, 0, false)
+                            _ambient_track(c)
+                        end)
                     end
                 end)
             end)
@@ -2462,6 +2600,11 @@ LoopAsync(1000, function()
             else
                 if _abyss_active then
                     _abyss_miss = _abyss_miss + 1
+                    -- Diagnostic: every poll while _abyss_miss is incrementing
+                    -- logs the player Z so we can see why deactivation isn't
+                    -- firing. Quiet otherwise.
+                    print(string.format("[WilderenaClient] abyss exit pending: miss=%d Z=%.0f%s",
+                        _abyss_miss, loc.Z, string.char(10)))
                     if _abyss_miss >= 3 then    -- ~3s of "outside" before tearing down (prevents boundary thrash)
                         _abyss_miss = 0
                         _deactivate_abyss_fires()
@@ -2617,6 +2760,14 @@ LoopAsync(1000, function()
                     if now == 2 then _d2_spawn(w, D2_ONCHAR, p:K2_GetActorLocation(), D2_FX_SCALE) end
                     print("[WilderenaClient] Dungeon FX: ENTER dungeon " .. now .. " (fog=" .. d.fog .. ")" .. string.char(10))
                 else
+                    -- DFX exit = player is back in arena. The independent abyss
+                    -- proximity poll should also fire deactivation but isn't
+                    -- reliably triggering (observed 2026-05-26: fires + wisps
+                    -- persisted after D1 exit). Force it here as a belt-and-
+                    -- braces: if abyss is still active when DFX clears, tear
+                    -- it down. Idempotent — _deactivate_abyss_fires early-returns
+                    -- when already deactivated.
+                    if _abyss_active then pcall(_deactivate_abyss_fires) end
                     print("[WilderenaClient] Dungeon FX: EXIT" .. string.char(10))
                 end
             end

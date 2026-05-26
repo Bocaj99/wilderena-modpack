@@ -8,6 +8,7 @@ Client modpack for **Wilderena**, a 3v3 Capture-the-Flag PvP mode for
 
 ## What's new
 
+- **v1.0.6** — Multiplayer fixes + D1 crash hardening. Local-pawn detection rewritten with 3 fallback methods so the dungeon VFX activates for ALL players, not just the first. Ambient Niagara components now ring-capped at 30 to prevent MallocBinned2 allocator crash on D1 exit. Abyss properly deactivates on dungeon exit (was leaking forever due to a Lua scoping bug). Abyssal demon Niagara assets pinned at client boot to reduce render-thread faults during the boss fight. D1 big fires repositioned to the 3-coord scatter at the abyss floor.
 - **v1.0.5** — D1 Abyss fires now centered on the TP→boss axis instead of spread L/M/R; wisp/explosion height raised to player eye level. D2 (Fellhollow) Imaru bursts + mana-build gate scaled down to half size. Fixes crash class that hit when the abyss VFX overlapped the D1 boss-fight zone.
 - **v1.0.4** — Dev keybinds gated behind a release-time flag (no longer firing for players). Hysteresis added to abyss + dungeon proximity polls (3 misses required before tear-down) — prevents boundary-thrash crash class.
 - **v1.0.3** — Camera snaps when you join a class lobby (faces outward), spawn into the arena (faces the enemy), and enter a dungeon (faces the boss).
