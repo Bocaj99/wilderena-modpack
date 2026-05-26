@@ -2275,10 +2275,13 @@ print("[WilderenaClient] Loaded — event-driven architecture, CapsLock=scoreboa
 -- No background load when not in dungeon → eliminates death-window crash race.
 -- =============================================================================
 local abyss_fire_coords = {
-    -- 3 distinct big fires along the centroid Y, ~1700u apart on X (left / middle / right)
-    {X=13350, Y=187900, Z=-2779},   -- left
-    {X=15050, Y=187900, Z=-2779},   -- middle
-    {X=16750, Y=187900, Z=-2779},   -- right
+    -- 3 fires stacked at the centre, on the TP-dest→boss-spawn axis (2026-05-26).
+    -- TP dest=(17640,185280,-1392), boss=(15042,187920,-1691). XY midpoint
+    -- (16341,186600) is also DFX[1].c. Stacking 3 at the same point gives a
+    -- triple-intensity central pyre that's straight on as you spawn in.
+    {X=16341, Y=186600, Z=-2779},
+    {X=16341, Y=186600, Z=-2779},
+    {X=16341, Y=186600, Z=-2779},
 }
 local ABYSS_CENTROID = {X=15050, Y=187900, Z=-2379}
 -- Abyss is DIRECTLY BELOW the arena → can't use 3D distance (arena shares XY).
@@ -2356,7 +2359,10 @@ end
 
 local function _abyss_rand_pos()
     local base = abyss_fire_coords[math.random(#abyss_fire_coords)]
-    return {X = base.X + (math.random()-0.5)*400, Y = base.Y + (math.random()-0.5)*400, Z = base.Z + 800 + math.random()*400}
+    -- Wisp/explosion Z raised 2026-05-26 — was base.Z + 800..1200 (Z range
+    -- -1979..-1579, well below TP dest Z=-1392). New range base.Z + 1800..2200
+    -- (Z -979..-579) puts them at and above player eye-level for visibility.
+    return {X = base.X + (math.random()-0.5)*400, Y = base.Y + (math.random()-0.5)*400, Z = base.Z + 1800 + math.random()*400}
 end
 
 -- Ambient loops — started once at module load, gated on _abyss_active
@@ -2439,6 +2445,10 @@ LoopAsync(1000, function()
             if not p or not p:IsValid() then return end
             local loc = p:K2_GetActorLocation()
             local in_abyss = false
+            -- Note 2026-05-26: dungeon gate temporarily added then reverted.
+            -- Original abyss×D1 crash root cause was the demon's broken native
+            -- Niagara DI components. Demon now killable cleanly; abyss loops
+            -- (wisps + explosions + big fires) safe to run in D1 alongside.
             if loc.Z < ABYSS_Z_THRESHOLD then
                 local dx = loc.X - ABYSS_CENTROID.X
                 local dy = loc.Y - ABYSS_CENTROID.Y
@@ -2497,7 +2507,7 @@ local DFX = {
     [1] = { c = {X=16341,Y=186600}, zlo=-2700, zhi=-1000, rsq=3800*3800,
             gate = {X=17640,Y=185280,Z=-1392}, gfx=MANA.."Fire",   gs=2.5, fog="light" },
     [2] = { c = {X=6553,Y=187511},  zlo=-99999, zhi=-2700, rsq=3500*3500,
-            gate = {X=8148,Y=185855,Z=-3124},  gfx=MANA.."Nature", gs=2.5, fog="swamp",
+            gate = {X=8148,Y=185855,Z=-3124},  gfx=MANA.."Nature", gs=1.25, fog="swamp",
             boss = {X=4958,Y=189167,Z=-3516} },
     [3] = { c = {X=10756,Y=180712}, zlo=1000, zhi=99999, rsq=3500*3500,
             gate = {X=12458,Y=178999,Z=1684},  gfx=MANA.."Air",    gs=2.5, fog="light" },
@@ -2505,7 +2515,7 @@ local DFX = {
 local D2_ONCHAR = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_OnCharacter"
 local D2_BURST  = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_Burst"
 local D2_SEAL   = "/Game/Art/VFX/Library/Env/Fellhollow/ImaruSeal/NS_VFX_TowerSealBreak_Door"
-local D2_FX_SCALE = 2.5
+local D2_FX_SCALE = 1.25   -- halved 2026-05-26 per user (Imaru OnChar/Burst + SealBreak); D1/D3 left at 2.5
 local D2_LOOP_MS = 1500
 local FOG_SCALE = { X = 70.0, Y = 70.0, Z = 20.0 }   -- LocalFogVolume coverage (tune)
 
@@ -2596,6 +2606,10 @@ LoopAsync(1000, function()
                 _dfx_clear()
                 _dfx_cur = now
                 if now ~= 0 then
+                    -- D1 abyss loops can coexist with this DFX entry now (gate
+                    -- reverted 2026-05-26 — original crash was demon native VFX,
+                    -- not the loops themselves). Big fires + wisps + explosions
+                    -- come from the abyss proximity poll when player Z drops.
                     local d = DFX[now]
                     local w = p:GetWorld()
                     _dfx_gate = _d2_spawn(w, d.gfx, d.gate, d.gs)

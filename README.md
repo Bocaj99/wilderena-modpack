@@ -8,6 +8,8 @@ Client modpack for **Wilderena**, a 3v3 Capture-the-Flag PvP mode for
 
 ## What's new
 
+- **v1.0.5** — D1 Abyss fires now centered on the TP→boss axis instead of spread L/M/R; wisp/explosion height raised to player eye level. D2 (Fellhollow) Imaru bursts + mana-build gate scaled down to half size. Fixes crash class that hit when the abyss VFX overlapped the D1 boss-fight zone.
+- **v1.0.4** — Dev keybinds gated behind a release-time flag (no longer firing for players). Hysteresis added to abyss + dungeon proximity polls (3 misses required before tear-down) — prevents boundary-thrash crash class.
 - **v1.0.3** — Camera snaps when you join a class lobby (faces outward), spawn into the arena (faces the enemy), and enter a dungeon (faces the boss).
 - **v1.0.2** — Fixed the Abyss dungeon fire VFX not rendering for the 2nd player (now lights up per-player, faster).
 - **v1.0.1** — Build menu disabled during play (admins toggle with `!builder`).
