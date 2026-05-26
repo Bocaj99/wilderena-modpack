@@ -17,6 +17,9 @@ local _cached_vent_class = nil  -- BP_AnimaVent_C class reference (cached from p
 -- from the Wilderena server-side mod).
 -- ============================================================================
 local _wilderena_active = false
+-- Dev/test gate: set true locally to enable VFX/fog test cyclers on keys 6/7/8/9.
+-- Source ships as false so the public modpack release doesn't include dev keys.
+local WILDERENA_DEV = false
 local function _activate_wilderena()
     if _wilderena_active then return end
     _wilderena_active = true
@@ -1421,6 +1424,7 @@ local _fog_styles = {
 local _fog_idx = 0
 local _fog_actor = nil
 RegisterKeyBind(Key.SEVEN, function()
+    if not WILDERENA_DEV then return end
     ExecuteInGameThread(function()
         pcall(function()
             if _fog_actor and _fog_actor:IsValid() then pcall(function() _fog_actor:K2_DestroyActor() end) end
@@ -1460,8 +1464,8 @@ RegisterKeyBind(Key.SEVEN, function()
     end)
 end)
 
-RegisterKeyBind(Key.EIGHT, function() _vfx_test_cycle(_VFX_TEST_FELLHOLLOW, "fell", "Fellhollow") end)
-RegisterKeyBind(Key.NINE, function() _vfx_test_cycle(_VFX_TEST_DOWDUN, "dow", "DowdunReach") end)
+RegisterKeyBind(Key.EIGHT, function() if not WILDERENA_DEV then return end _vfx_test_cycle(_VFX_TEST_FELLHOLLOW, "fell", "Fellhollow") end)
+RegisterKeyBind(Key.NINE, function() if not WILDERENA_DEV then return end _vfx_test_cycle(_VFX_TEST_DOWDUN, "dow", "DowdunReach") end)
 
 -- F9 = toggle build permission (for dungeon authoring). Default is BLOCKED.
 RegisterKeyBind(Key.F9, function()
@@ -2624,6 +2628,7 @@ local _k6_list = {
 }
 local _k6_idx = 0
 RegisterKeyBind(Key.SIX, function()
+    if not WILDERENA_DEV then return end
     ExecuteInGameThread(function()
         pcall(function()
             _k6_idx = (_k6_idx % #_k6_list) + 1
