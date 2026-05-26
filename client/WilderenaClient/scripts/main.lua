@@ -2284,6 +2284,7 @@ local ABYSS_Z_THRESHOLD = -1000
 local ABYSS_XY_RADIUS_SQ = 6000 * 6000
 
 local _abyss_active = false
+local _abyss_miss = 0   -- hysteresis: require N consecutive misses before deactivating
 local _abyss_fire_comps = {}  -- spawned NiagaraComponents (for despawn)
 local _abyss_nia_systems = {}  -- cached system refs (loaded once)
 
@@ -2442,9 +2443,16 @@ LoopAsync(1000, function()
                 end
             end
             if in_abyss then
+                _abyss_miss = 0
                 if not _abyss_active then _activate_abyss_fires() end
             else
-                if _abyss_active then _deactivate_abyss_fires() end
+                if _abyss_active then
+                    _abyss_miss = _abyss_miss + 1
+                    if _abyss_miss >= 3 then    -- ~3s of "outside" before tearing down (prevents boundary thrash)
+                        _abyss_miss = 0
+                        _deactivate_abyss_fires()
+                    end
+                end
             end
         end)
     end)
@@ -2498,6 +2506,7 @@ local D2_LOOP_MS = 1500
 local FOG_SCALE = { X = 70.0, Y = 70.0, Z = 20.0 }   -- LocalFogVolume coverage (tune)
 
 local _dfx_cur = 0
+local _dfx_miss = 0   -- hysteresis on dungeon exit (prevents boundary spawn/destroy thrash)
 local _dfx_gate = nil
 local _dfx_fog = nil
 
@@ -2574,6 +2583,12 @@ LoopAsync(1000, function()
                 end
             end
             if now ~= _dfx_cur then
+                if now == 0 and _dfx_cur ~= 0 then
+                    -- exiting: require ~3 consecutive ticks "outside" before tearing down
+                    _dfx_miss = _dfx_miss + 1
+                    if _dfx_miss < 3 then return end
+                end
+                _dfx_miss = 0
                 _dfx_clear()
                 _dfx_cur = now
                 if now ~= 0 then
