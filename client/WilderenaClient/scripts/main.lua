@@ -2271,10 +2271,10 @@ print("[WilderenaClient] Loaded — event-driven architecture, CapsLock=scoreboa
 -- No background load when not in dungeon → eliminates death-window crash race.
 -- =============================================================================
 local abyss_fire_coords = {
-    -- 4 big fires, two on each side, spread to room corners so x14 fires don't merge.
-    -- Z lowered to -2779 (another -300).
+    -- 4 corners + 1 middle (5 big fires, 2 each side + center)
     {X=16750, Y=186600, Z=-2779}, {X=16750, Y=189200, Z=-2779},   -- right side
     {X=13350, Y=186600, Z=-2779}, {X=13350, Y=189200, Z=-2779},   -- left side
+    {X=15050, Y=187900, Z=-2779},                                  -- middle
 }
 local ABYSS_CENTROID = {X=15050, Y=187900, Z=-2379}
 -- Abyss is DIRECTLY BELOW the arena → can't use 3D distance (arena shares XY).
@@ -2297,6 +2297,9 @@ local function _abyss_load_systems()
     }
     for _, p in pairs(paths) do pcall(function() LoadAsset(p) end) end
     for k, p in pairs(paths) do _abyss_nia_systems[k] = StaticFindObject(p) end
+    local s = {}
+    for k, v in pairs(_abyss_nia_systems) do s[k] = (v and v:IsValid()) and "OK" or "MISSING" end
+    print("[WilderenaClient] Abyss systems load: big=" .. (s.big or "?") .. " fs=" .. (s.fs or "?") .. " i1=" .. (s.i1 or "?") .. " i2=" .. (s.i2 or "?") .. string.char(10))
     return _abyss_nia_systems.big ~= nil
 end
 
