@@ -2546,6 +2546,11 @@ local _k6_list = {
     { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Nature", s = 5.0 },
     { p = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_Air",    s = 5.0 },
     { p = "/Game/Marketplace/Realistic_Pack/Niagara/Fire/NS_Fire_Big_2",      s = 14.0 },
+    { p = "/Game/Art/VFX/Library/AbyssalDemonFX/Export/AbyssalOrb/NS_AbyssalDemon_Orb",            s = 1.0 },
+    { p = "/Game/Art/VFX/Library/AbyssalDemonFX/Export/AbyssalOrb/NS_AbyssalDemon_Orb_EnergyLoop", s = 1.0 },
+    { p = "/Game/Art/VFX/Library/Item/NS_VaultCore_EnergyOut",                s = 1.0 },
+    { p = "/Game/Art/VFX/Library/Spells/Surge/NS_Surge_Core",                 s = 1.0 },
+    { p = "/Game/Art/VFX/Library/Combat/Magic/Air/NS_Magic_Air_Secondary_Charge_Sphere", s = 1.0 },
 }
 local _k6_idx = 0
 RegisterKeyBind(Key.SIX, function()
