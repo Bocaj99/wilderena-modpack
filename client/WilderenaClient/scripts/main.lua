@@ -2455,3 +2455,83 @@ LoopAsync(1000, function()
     end)
     return false
 end)
+
+
+-- ============================================================================
+-- DUNGEON 2 (Zogre / Decayed Ruin) AMBIENCE  -- Fellhollow Imaru effects
+-- Client-side, proximity-driven (like the Abyss fires). Dungeon 2 sits deep
+-- (Z ~ -3124). On ENTRY: ImaruGaze_OnCharacter fires on the player. While
+-- INSIDE: ImaruGaze_Burst + TowerSealBreak_Door spawn every ~1.5s near you.
+-- Size is scaled by D2_FX_SCALE (tune to taste).
+-- ============================================================================
+local D2_CENTER = { X = 6553, Y = 187511 }   -- midpoint of dungeon-2 destination + boss
+local D2_Z_MAX = -2700                        -- player below this (and in radius) = inside D2
+local D2_XY_RADIUS_SQ = 5000 * 5000
+local D2_FX_SCALE = 2.5                        -- effect size multiplier
+local D2_LOOP_MS = 1500                        -- recurring interval (~1-2s)
+local D2_ONCHAR = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_OnCharacter"
+local D2_BURST  = "/Game/Art/VFX/Library/Env/Fellhollow/Withering/ImaruGaze/NS_VFX_Character_ImaruGaze_Burst"
+local D2_SEAL   = "/Game/Art/VFX/Library/Env/Fellhollow/ImaruSeal/NS_VFX_TowerSealBreak_Door"
+local _d2_active = false
+
+local function _d2_spawn(world, pkg, pos, scale)
+    local name = pkg:match("/([^/]+)$")
+    local full = pkg .. "." .. name
+    local sys = _cached_niagara_sys[name]
+    if not sys or not sys:IsValid() then pcall(function() sys = StaticFindObject(full) end) end
+    if not sys or not sys:IsValid() then
+        pcall(function() LoadAsset(pkg) end)
+        pcall(function() sys = StaticFindObject(full) end)
+        if sys and sys:IsValid() then _cached_niagara_sys[name] = sys end
+    end
+    if not sys or not sys:IsValid() then return nil end
+    local lib = get_niagara_lib()
+    if not lib then return nil end
+    local s = scale or 1.0
+    return lib:SpawnSystemAtLocation(world, sys, pos, { Pitch = 0, Yaw = 0, Roll = 0 }, { X = s, Y = s, Z = s }, true, true, 0, false)
+end
+
+-- recurring ambient (gated on _d2_active)
+LoopAsync(D2_LOOP_MS, function()
+    if _d2_active then
+        ExecuteInGameThread(function()
+            pcall(function()
+                local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
+                if not p or not p:IsValid() then return end
+                local w = p:GetWorld()
+                local pos = p:K2_GetActorLocation()
+                local function rnd() return (math.random() - 0.5) * 600 end
+                _d2_spawn(w, D2_BURST, { X = pos.X + rnd(), Y = pos.Y + rnd(), Z = pos.Z + 100 }, D2_FX_SCALE)
+                _d2_spawn(w, D2_SEAL,  { X = pos.X + rnd(), Y = pos.Y + rnd(), Z = pos.Z + 50 },  D2_FX_SCALE)
+            end)
+        end)
+    end
+    return false
+end)
+
+-- proximity poll (1s): detect dungeon-2 entry/exit
+LoopAsync(1000, function()
+    if not _wilderena_active then return false end
+    ExecuteInGameThread(function()
+        pcall(function()
+            local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
+            if not p or not p:IsValid() then return end
+            local loc = p:K2_GetActorLocation()
+            local inside = false
+            if loc.Z < D2_Z_MAX then
+                local dx = loc.X - D2_CENTER.X
+                local dy = loc.Y - D2_CENTER.Y
+                if (dx * dx + dy * dy) < D2_XY_RADIUS_SQ then inside = true end
+            end
+            if inside and not _d2_active then
+                _d2_active = true
+                _d2_spawn(p:GetWorld(), D2_ONCHAR, p:K2_GetActorLocation(), D2_FX_SCALE)
+                print("[WilderenaClient] Dungeon 2 ambience: ENTER" .. string.char(10))
+            elseif (not inside) and _d2_active then
+                _d2_active = false
+                print("[WilderenaClient] Dungeon 2 ambience: EXIT" .. string.char(10))
+            end
+        end)
+    end)
+    return false
+end)
