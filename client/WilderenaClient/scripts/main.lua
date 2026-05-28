@@ -12,7 +12,7 @@
 -- modpack install did not take (old main.lua still in place / wrong copy path).
 -- Bump this string on every release.
 -- ============================================================================
-local CLIENT_BUILD = "v1.0.8"
+local CLIENT_BUILD = "v1.0.9"
 print("[WilderenaClient] ===== BUILD " .. CLIENT_BUILD .. " loaded =====\n")
 
 local scoreboard_visible = false
@@ -148,9 +148,19 @@ end
 local preload_powerup_assets  -- forward declaration
 
 local function despawn_niagara(comp)
+    -- B-UAF 2026-05-28 (Layer 3): guard validity before touching. comp may already be
+    -- auto-destroyed / GC'd; a native call on a freed component is a hard crash that
+    -- pcall CANNOT catch (pcall only traps Lua errors, not access violations). One
+    -- IsValid gate inside the pcall covers both calls. DestroyComponent is retained
+    -- here only because these are arena orbs/beams removed by occasional single calls
+    -- (not a tight D1 loop — that path is now deactivate-only / fire-and-forget).
     if comp then
-        pcall(function() comp:Deactivate() end)
-        pcall(function() comp:DestroyComponent() end)
+        pcall(function()
+            if comp:IsValid() then
+                comp:Deactivate()
+                comp:DestroyComponent()
+            end
+        end)
     end
 end
 
@@ -2457,25 +2467,17 @@ end
 -- outer pcall in the proximity poll swallowed it, and _abyss_active stayed
 -- true forever. Confirmed via "abyss exit pending miss=3 -> miss=1" cycle
 -- pattern in the client diagnostic 2026-05-26.
-local _abyss_ambient_comps = {}
+local _abyss_ambient_comps = {}  -- B-UAF: kept for compat; no longer populated
 local MAX_AMBIENT_COMPS = 30
+-- B-UAF 2026-05-28 (Layer 1, fire-and-forget): ambient wisp/explosion systems are
+-- spawned with bAutoDestroy=true, so the ENGINE owns and frees them when they finish.
+-- The old ring buffer ALSO retained each component and later called DeactivateImmediate
+-- on it — but by then the component had often already auto-destroyed, so we were touching
+-- freed memory. That is the use-after-free crash (EXCEPTION_ACCESS_VIOLATION reading
+-- 0xFFFF...FFFF, confirmed in the ue4ss/crash_*.dmp UE4SS-cluster faults). You cannot
+-- use-after-free an object you never hold: spawn and forget, never retain a reference.
 local function _ambient_track(comp)
-    if not comp then return end
-    table.insert(_abyss_ambient_comps, comp)
-    while #_abyss_ambient_comps > MAX_AMBIENT_COMPS do
-        local oldest = table.remove(_abyss_ambient_comps, 1)
-        pcall(function()
-            if oldest and oldest:IsValid() then
-                pcall(function() oldest:DeactivateImmediate() end)
-                -- B16 FIX 2026-05-28: DestroyComponent disabled (same crash
-                -- class as the documented B2 server-side issue). Engine GCs
-                -- deactivated Niagara within a few seconds. Ring buffer just
-                -- needs to drop OUR reference so it stops re-deactivating;
-                -- engine ownership handles actual destroy.
-                -- pcall(function() oldest:DestroyComponent() end)
-            end
-        end)
-    end
+    -- intentionally a NO-OP: do not retain a reference to an auto-destroying component.
 end
 
 local function _deactivate_abyss_fires()
@@ -2491,32 +2493,26 @@ local function _deactivate_abyss_fires()
     -- Fix: DeactivateImmediate ONLY. Don't DestroyComponent. The engine GCs
     -- deactivated Niagara components within a few seconds; that's safe.
     -- DestroyComponent races with engine actor-destroy cascades = crash.
+    -- B-UAF 2026-05-28 (Layer 3): snapshot + DROP the ref list FIRST, so a concurrent
+    -- proximity-poll tick can't grab the same components and double-touch them after we
+    -- start deactivating. Then deactivate each (IsValid-guarded). Never DestroyComponent.
+    local fires = _abyss_fire_comps
+    _abyss_fire_comps = {}
+    _abyss_active = false
     local deactivated = 0
-    for _, comp in ipairs(_abyss_fire_comps) do
+    for _, comp in ipairs(fires) do
         pcall(function()
             if comp and comp:IsValid() then
                 pcall(function() comp:DeactivateImmediate() end)  -- safe: kills live particles
-                -- pcall(function() comp:DestroyComponent() end)  -- DISABLED: B16 crash class
                 deactivated = deactivated + 1
             end
         end)
     end
-    _abyss_fire_comps = {}
-    -- Same for ambient components — deactivate only, let engine GC handle it.
-    local amb_deactivated = 0
-    for _, comp in ipairs(_abyss_ambient_comps) do
-        pcall(function()
-            if comp and comp:IsValid() then
-                pcall(function() comp:DeactivateImmediate() end)
-                -- pcall(function() comp:DestroyComponent() end)  -- DISABLED: B16
-                amb_deactivated = amb_deactivated + 1
-            end
-        end)
-    end
+    -- B-UAF (Layer 1): ambient is now fire-and-forget (bAutoDestroy=true, untracked).
+    -- Nothing to deactivate — touching auto-destroyed components WAS the use-after-free.
     _abyss_ambient_comps = {}
-    _abyss_active = false
-    print(string.format("[WilderenaClient] Abyss Fire Zone: DEACTIVATED (big=%d ambient=%d) [no-destroy B16]%s",
-        deactivated, amb_deactivated, string.char(10)))
+    print(string.format("[WilderenaClient] Abyss Fire Zone: DEACTIVATED (big=%d, ambient=fire-and-forget) [B-UAF no-destroy]%s",
+        deactivated, string.char(10)))
 end
 
 local function _abyss_rand_pos()
@@ -2725,13 +2721,18 @@ local function _dfx_spawn_fog(world, d)
 end
 
 local function _dfx_clear()
-    if _dfx_gate and _dfx_gate:IsValid() then
-        pcall(function() _dfx_gate:DeactivateImmediate() end)
-        pcall(function() _dfx_gate:DestroyComponent() end)
-    end
-    if _dfx_fog and _dfx_fog:IsValid() then pcall(function() _dfx_fog:K2_DestroyActor() end) end
+    -- B-UAF 2026-05-28 (Layer 2/3): NEVER DestroyComponent a Niagara from Lua. The
+    -- gate is spawned bAutoDestroy=true, so manually destroying it races the engine's
+    -- own teardown (use-after-free / B16 / EXCEPTION_ACCESS_VIOLATION on 0xFFFF...).
+    -- Drop our refs FIRST (so a concurrent poll can't grab + double-touch the same
+    -- component), THEN deactivate (IsValid-guarded). The engine frees the component.
+    -- The fog is a LocalFogVolume ACTOR — K2_DestroyActor is the engine's safe deferred
+    -- actor-destroy, which cleans the actor + its components atomically. That's fine.
+    local gate, fog = _dfx_gate, _dfx_fog
     _dfx_gate = nil
     _dfx_fog = nil
+    if gate then pcall(function() if gate:IsValid() then gate:DeactivateImmediate() end end) end
+    if fog then pcall(function() if fog:IsValid() then fog:K2_DestroyActor() end end) end
 end
 
 LoopAsync(D2_LOOP_MS, function()
