@@ -12,7 +12,7 @@
 -- modpack install did not take (old main.lua still in place / wrong copy path).
 -- Bump this string on every release.
 -- ============================================================================
-local CLIENT_BUILD = "v1.0.10"
+local CLIENT_BUILD = "v1.0.11"
 print("[WilderenaClient] ===== BUILD " .. CLIENT_BUILD .. " loaded =====\n")
 
 local scoreboard_visible = false
@@ -2440,10 +2440,12 @@ end
 -- setting _abyss_active, so the big fires (NS_Fire_Big_2 x3 @scale 14) AND the ambient
 -- wisp/explosion loops (gated on _abyss_active) all skip. If abyss entry stops crashing,
 -- the cause is confirmed and we can re-introduce a lighter version behind this flag.
-local ABYSS_VFX_ENABLED = false
+-- B56: spawn ONLY the middle fire @scale 10 (was 3x @14); keep ambient OFF.
+local ABYSS_BIG_FIRE_ENABLED = true    -- middle fire, scale 10
+local ABYSS_AMBIENT_ENABLED  = false   -- wisps + fire-explosions stay OFF (load)
 
 local function _activate_abyss_fires()
-    if not ABYSS_VFX_ENABLED then return end  -- B55: abyss VFX disabled (engine-cluster entry crash)
+    if not (ABYSS_BIG_FIRE_ENABLED or ABYSS_AMBIENT_ENABLED) then return end
     if _abyss_active then return end
     local player = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
     if not player or not player:IsValid() then return end
@@ -2456,20 +2458,30 @@ local function _activate_abyss_fires()
         return
     end
 
-    local big_sys = _abyss_nia_systems.big
     local count = 0
     _abyss_fire_comps = {}
-    for _, c in ipairs(abyss_fire_coords) do
+    -- B56: ONE fire (the middle coord) at scale 10, not 3 at 14 (~80% less load) to
+    -- dodge the engine-cluster entry crash while keeping a centerpiece flame.
+    if ABYSS_BIG_FIRE_ENABLED then
+        local big_sys = _abyss_nia_systems.big
+        local mid = abyss_fire_coords[2]  -- middle of the 3 floor positions
         pcall(function()
-            local f = nflib:SpawnSystemAtLocation(world, big_sys, c, {Pitch=0,Yaw=0,Roll=0}, {X=14,Y=14,Z=14}, false, true, 0, false)
+            local f = nflib:SpawnSystemAtLocation(world, big_sys, mid, {Pitch=0,Yaw=0,Roll=0}, {X=10,Y=10,Z=10}, false, true, 0, false)
             if f then
                 count = count + 1
                 table.insert(_abyss_fire_comps, f)
+                -- B56 best-effort cull (smoke / spawn-rate). Names are guesses for the
+                -- marketplace asset; pcall makes a miss a harmless no-op. True smoke
+                -- removal needs the NS_Fire_Big_2 asset edited + the .pak repackaged.
+                pcall(function() f:SetEmitterEnable("Smoke", false) end)
+                pcall(function() f:SetEmitterEnable("smoke", false) end)
+                pcall(function() f:SetVariableFloat("User.SmokeAmount", 0.0) end)
+                pcall(function() f:SetVariableFloat("User.SpawnRateScale", 0.5) end)
             end
         end)
     end
     _abyss_active = true
-    print(string.format("[WilderenaClient] Abyss Fire Zone: ACTIVATED (%d/%d fires)\n", count, #abyss_fire_coords))
+    print(string.format("[WilderenaClient] Abyss Fire Zone: ACTIVATED (middle-only %d fire @x10, ambient=%s)\n", count, tostring(ABYSS_AMBIENT_ENABLED)))
 end
 
 -- Ambient ring buffer + tracker MUST be declared BEFORE _deactivate_abyss_fires
@@ -2547,6 +2559,7 @@ LoopAsync(500, function()
                 local w = p:GetWorld()
                 if not w then return end
                 local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
+                if not ABYSS_AMBIENT_ENABLED then return end  -- B56: ambient wisps OFF
                 local fs_sys = _abyss_nia_systems.fs
                 if not nflib or not fs_sys or not fs_sys:IsValid() then return end
                 for _ = 1, 3 do pcall(function()
@@ -2569,6 +2582,7 @@ LoopAsync(2000, function()
                 local w = p:GetWorld()
                 if not w then return end
                 local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
+                if not ABYSS_AMBIENT_ENABLED then return end  -- B56: ambient explosions OFF
                 local i1 = _abyss_nia_systems.i1
                 if nflib and i1 and i1:IsValid() then
                     pcall(function()
@@ -2593,6 +2607,7 @@ ExecuteWithDelay(1000, function()
                     local w = p:GetWorld()
                     if not w then return end
                     local nflib = StaticFindObject("/Script/Niagara.Default__NiagaraFunctionLibrary")
+                    if not ABYSS_AMBIENT_ENABLED then return end  -- B56: ambient explosions OFF
                     local i2 = _abyss_nia_systems.i2
                     if nflib and i2 and i2:IsValid() then
                         pcall(function()
