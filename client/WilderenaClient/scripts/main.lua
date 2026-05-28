@@ -5,6 +5,16 @@
     Three hooks: MC_Event (instant VFX), MC_Timer (1s display), MC_Scoreboard (5s stats)
 ]]
 
+-- ============================================================================
+-- BUILD STAMP — prints unconditionally at script load (NOT gated on server
+-- detection), so anyone can verify which client version is actually running:
+-- check UE4SS.log for this line. If it's absent or shows an OLD version, the
+-- modpack install did not take (old main.lua still in place / wrong copy path).
+-- Bump this string on every release.
+-- ============================================================================
+local CLIENT_BUILD = "v1.0.8"
+print("[WilderenaClient] ===== BUILD " .. CLIENT_BUILD .. " loaded =====\n")
+
 local scoreboard_visible = false
 local niagaraLib = nil
 local _cached_niagara_sys = {}  -- [asset_name] = NiagaraSystem UObject (cached from pin phase, prevents GC)
