@@ -12,7 +12,7 @@
 -- modpack install did not take (old main.lua still in place / wrong copy path).
 -- Bump this string on every release.
 -- ============================================================================
-local CLIENT_BUILD = "v1.0.9"
+local CLIENT_BUILD = "v1.0.10"
 print("[WilderenaClient] ===== BUILD " .. CLIENT_BUILD .. " loaded =====\n")
 
 local scoreboard_visible = false
@@ -2432,7 +2432,18 @@ local function _abyss_load_systems()
     return _abyss_nia_systems.big ~= nil
 end
 
+-- B55 2026-05-28: KILL-SWITCH for all client-spawned abyss VFX. Entering the abyss
+-- reliably crashed BOTH clients with an ENGINE-cluster fault (RSDragonwilds.exe
+-- +0x16103xx, same address across 11:37/19:13/22:56) — the engine's own render/Niagara
+-- code, NOT the UE4SS use-after-free v1.0.9 fixed. We can't patch the engine, only stop
+-- feeding it the heavy abyss VFX. With this false, _activate_abyss_fires returns before
+-- setting _abyss_active, so the big fires (NS_Fire_Big_2 x3 @scale 14) AND the ambient
+-- wisp/explosion loops (gated on _abyss_active) all skip. If abyss entry stops crashing,
+-- the cause is confirmed and we can re-introduce a lighter version behind this flag.
+local ABYSS_VFX_ENABLED = false
+
 local function _activate_abyss_fires()
+    if not ABYSS_VFX_ENABLED then return end  -- B55: abyss VFX disabled (engine-cluster entry crash)
     if _abyss_active then return end
     local player = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
     if not player or not player:IsValid() then return end
