@@ -1261,7 +1261,7 @@ end
 -- ============================================================================
 local _bb_local_pawn = nil
 local _bb_pawn_logged = false  -- one-time diagnostic on first cache hit
-local function _bb_get_local_pawn()
+local function _bb_get_local_pawn(strict)
     local ok = false
     pcall(function() ok = _bb_local_pawn and _bb_local_pawn:IsValid() end)
     if ok then return _bb_local_pawn end
@@ -1316,13 +1316,20 @@ local function _bb_get_local_pawn()
         end
     end
 
+    -- B50: strict callers (proximity polls that compare the pawn's position to a
+    -- dungeon zone) must NEVER receive a remote pawn — testing another player's
+    -- location is the "dungeon fog persists in arena after I exit while a teammate
+    -- stays in the dungeon" bug. Bail to nil rather than fall to the MP-unreliable
+    -- fallback; the poll then simply skips this tick.
+    if strict then return nil end
+
     -- Method 3 (last resort): first valid pawn. May be wrong in MP, but better
-    -- than nil. Logged loudly so we know we hit it.
+    -- than nil for non-strict callers (e.g. spawn-VFX-on-self). B50: NOT cached,
+    -- so a wrong guess never sticks — methods 1/2 get re-tried on the next call.
     for _, p in pairs(players) do
         local valid = false
         pcall(function() valid = p and p:IsValid() end)
         if valid then
-            _bb_local_pawn = p
             if not _bb_pawn_logged then
                 _bb_pawn_logged = true
                 pcall(function() print("[WilderenaClient] _bb_get_local_pawn: method=FIRST_PAWN_FALLBACK (UNRELIABLE in MP) name=" .. p:GetFullName() .. string.char(10)) end)
@@ -2029,7 +2036,9 @@ RegisterKeyBind(Key.F4, function()
                                     local fp = FLAG_POSITIONS[team]
                                     if math.abs(loc.X - fp.X) < 500 and math.abs(loc.Y - fp.Y) < 500 then
                                         comp:Deactivate()
-                                        comp:DestroyComponent()
+                                        -- B16: DestroyComponent disabled (same crash class as abyss-exit B16).
+                                        -- Engine GC handles destroy after Deactivate.
+                                        -- comp:DestroyComponent()
                                         cleared = cleared + 1
                                         break
                                     end
@@ -2076,7 +2085,8 @@ RegisterKeyBind(Key.F4, function()
                                     local dy = math.abs(loc.Y - pp.Y)
                                     if dx < 500 and dy < 500 then
                                         comp:Deactivate()
-                                        comp:DestroyComponent()
+                                        -- B16: DestroyComponent disabled (same crash class as abyss-exit B16).
+                                        -- comp:DestroyComponent()
                                         cleared = cleared + 1
                                         break
                                     end
@@ -2447,7 +2457,12 @@ local function _ambient_track(comp)
         pcall(function()
             if oldest and oldest:IsValid() then
                 pcall(function() oldest:DeactivateImmediate() end)
-                pcall(function() oldest:DestroyComponent() end)
+                -- B16 FIX 2026-05-28: DestroyComponent disabled (same crash
+                -- class as the documented B2 server-side issue). Engine GCs
+                -- deactivated Niagara within a few seconds. Ring buffer just
+                -- needs to drop OUR reference so it stops re-deactivating;
+                -- engine ownership handles actual destroy.
+                -- pcall(function() oldest:DestroyComponent() end)
             end
         end)
     end
@@ -2455,33 +2470,43 @@ end
 
 local function _deactivate_abyss_fires()
     if not _abyss_active then return end
-    local destroyed = 0
+    -- B16 FIX 2026-05-28: CLIENT CRASH on D1 exit (miss=3 trigger).
+    -- Crash dump captured at crash_2026_05_28_00_27_01 in exact same second as
+    -- "abyss exit pending: miss=3 Z=-492" log line. Crash class = same as the
+    -- documented server-side B2 (handoff doc) which was caused by calling
+    -- `DestroyComponent()` on engine-owned Niagara components in a tight loop.
+    -- Server-side that pattern was REVERTED (suspected MallocBinned2 contributor);
+    -- this client function still had it.
+    --
+    -- Fix: DeactivateImmediate ONLY. Don't DestroyComponent. The engine GCs
+    -- deactivated Niagara components within a few seconds; that's safe.
+    -- DestroyComponent races with engine actor-destroy cascades = crash.
+    local deactivated = 0
     for _, comp in ipairs(_abyss_fire_comps) do
         pcall(function()
             if comp and comp:IsValid() then
-                pcall(function() comp:DeactivateImmediate() end)  -- kill all live particles
-                pcall(function() comp:DestroyComponent() end)      -- full removal
-                destroyed = destroyed + 1
+                pcall(function() comp:DeactivateImmediate() end)  -- safe: kills live particles
+                -- pcall(function() comp:DestroyComponent() end)  -- DISABLED: B16 crash class
+                deactivated = deactivated + 1
             end
         end)
     end
     _abyss_fire_comps = {}
-    -- Also tear down all ambient (wisp/explosion) components — they accumulate
-    -- under the per-spawn cap and need a clean sweep on dungeon exit.
-    local amb_destroyed = 0
+    -- Same for ambient components — deactivate only, let engine GC handle it.
+    local amb_deactivated = 0
     for _, comp in ipairs(_abyss_ambient_comps) do
         pcall(function()
             if comp and comp:IsValid() then
                 pcall(function() comp:DeactivateImmediate() end)
-                pcall(function() comp:DestroyComponent() end)
-                amb_destroyed = amb_destroyed + 1
+                -- pcall(function() comp:DestroyComponent() end)  -- DISABLED: B16
+                amb_deactivated = amb_deactivated + 1
             end
         end)
     end
     _abyss_ambient_comps = {}
     _abyss_active = false
-    print(string.format("[WilderenaClient] Abyss Fire Zone: DEACTIVATED (big=%d ambient=%d)%s",
-        destroyed, amb_destroyed, string.char(10)))
+    print(string.format("[WilderenaClient] Abyss Fire Zone: DEACTIVATED (big=%d ambient=%d) [no-destroy B16]%s",
+        deactivated, amb_deactivated, string.char(10)))
 end
 
 local function _abyss_rand_pos()
@@ -2578,8 +2603,9 @@ LoopAsync(1000, function()
         pcall(function()
             -- LOCAL player only — FindFirstOf can return a REMOTE pawn in multiplayer,
             -- which made the abyss gate test the wrong player (fires didn't activate for
-            -- the 2nd player / appeared delayed). Reuse the local-pawn getter.
-            local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
+            -- the 2nd player / appeared delayed). B50: strict getter, no FindFirstOf
+            -- fallback — skip this tick rather than gate on a remote pawn's position.
+            local p = _bb_get_local_pawn(true)
             if not p or not p:IsValid() then return end
             local loc = p:K2_GetActorLocation()
             local in_abyss = false
@@ -2728,7 +2754,11 @@ LoopAsync(1000, function()
     end
     ExecuteInGameThread(function()
         pcall(function()
-            local p = _bb_get_local_pawn() or FindFirstOf("BP_PlayerCharacter_C")
+            -- B50: strict local-pawn getter (no FindFirstOf fallback). Previously a
+            -- nil local pawn fell back to FindFirstOf, which returns a REMOTE pawn
+            -- in MP — so while a teammate stayed in the dungeon, this poll read THEIR
+            -- position, kept _dfx_cur non-zero, and the fog never tore down on exit.
+            local p = _bb_get_local_pawn(true)
             if not p or not p:IsValid() then return end
             local loc = p:K2_GetActorLocation()
             local now = 0
