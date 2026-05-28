@@ -12,7 +12,7 @@
 -- modpack install did not take (old main.lua still in place / wrong copy path).
 -- Bump this string on every release.
 -- ============================================================================
-local CLIENT_BUILD = "v1.0.11"
+local CLIENT_BUILD = "v1.0.12"
 print("[WilderenaClient] ===== BUILD " .. CLIENT_BUILD .. " loaded =====\n")
 
 local scoreboard_visible = false
@@ -2440,8 +2440,14 @@ end
 -- setting _abyss_active, so the big fires (NS_Fire_Big_2 x3 @scale 14) AND the ambient
 -- wisp/explosion loops (gated on _abyss_active) all skip. If abyss entry stops crashing,
 -- the cause is confirmed and we can re-introduce a lighter version behind this flag.
+-- B57 2026-05-28: MASTER kill-switch for ALL client D1 VFX + both proximity polls.
+-- Isolation baseline: abyss entry still crashed BOTH clients on v1.0.11 with a UE4SS
+-- null-deref on TP (UE4SS.dll+0x248EA1) BEFORE our fire even spawned. false = the abyss
+-- AND DFX polls both no-op, so NOTHING of ours runs in D1. If entry STILL crashes ->
+-- it's the engine/game/teleport, NOT our mod. If it stops -> re-enable pieces 1 at a time.
+local D1_CLIENT_VFX_ENABLED = false
 -- B56: spawn ONLY the middle fire @scale 10 (was 3x @14); keep ambient OFF.
-local ABYSS_BIG_FIRE_ENABLED = true    -- middle fire, scale 10
+local ABYSS_BIG_FIRE_ENABLED = true    -- middle fire, scale 10 (moot while D1 disabled)
 local ABYSS_AMBIENT_ENABLED  = false   -- wisps + fire-explosions stay OFF (load)
 
 local function _activate_abyss_fires()
@@ -2627,6 +2633,7 @@ end)
 -- Arena is directly above Abyss, so 3D distance check would falsely include arena.
 -- Also gated on _wilderena_active so we never even poll on offline/non-Wilderena servers.
 LoopAsync(1000, function()
+    if not D1_CLIENT_VFX_ENABLED then return false end  -- B57: D1 client VFX fully disabled (isolation baseline)
     if not _wilderena_active then
         if _abyss_active then ExecuteInGameThread(function() pcall(_deactivate_abyss_fires) end) end
         return false
@@ -2785,6 +2792,7 @@ LoopAsync(D2_LOOP_MS, function()
 end)
 
 LoopAsync(1000, function()
+    if not D1_CLIENT_VFX_ENABLED then return false end  -- B57: D1 client VFX fully disabled (isolation baseline)
     if not _wilderena_active then
         if _dfx_cur ~= 0 then ExecuteInGameThread(function() pcall(_dfx_clear) end); _dfx_cur = 0 end
         return false
