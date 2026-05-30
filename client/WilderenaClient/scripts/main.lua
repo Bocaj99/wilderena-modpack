@@ -12,8 +12,47 @@
 -- modpack install did not take (old main.lua still in place / wrong copy path).
 -- Bump this string on every release.
 -- ============================================================================
-local CLIENT_BUILD = "v1.0.12"
+local CLIENT_BUILD = "v1.0.75"
 print("[WilderenaClient] ===== BUILD " .. CLIENT_BUILD .. " loaded =====\n")
+
+-- B-HOOKTRACE 2026-05-29: v1.0.15 still crashes with ALL VFX spawns gated, so the culprit is
+-- a HOOK handler touching a freed render object on the replicated team-join. This traces every
+-- hook entry to TWO flushed files (close() flushes, so they survive a hard 0-byte crash):
+--   ue4ss/Mods/WilderenaClient/hook_current.txt = last hook entered (overwrite) — at crash,
+--      names the hook that was running (hooks run serially on the game thread).
+--   ue4ss/Mods/WilderenaClient/hook_trace.txt   = full append sequence — the firing order.
+-- After a crash, read both to pinpoint which of the 5 hooks died.
+local _hook_seq = 0
+local function _htrace(name)
+    _hook_seq = _hook_seq + 1
+    local line = string.format("#%d %s", _hook_seq, name)
+    pcall(function()
+        local f = io.open("ue4ss/Mods/WilderenaClient/hook_current.txt", "w")
+        if f then f:write(line .. "\n"); f:close() end
+    end)
+    pcall(function()
+        local g = io.open("ue4ss/Mods/WilderenaClient/hook_trace.txt", "a")
+        if g then g:write(line .. "\n"); g:close() end
+    end)
+end
+pcall(function()
+    local f = io.open("ue4ss/Mods/WilderenaClient/hook_trace.txt", "w")
+    if f then f:write("=== session start ===\n"); f:close() end
+end)
+
+-- B-RENDERUAF 2026-05-29: crash dumps across abyss + team-node events ALL fault at the
+-- identical instruction D3D12Core.dll+0x96F0 reading 0xFFFFFFFFFFFFFFFF (poisoned freed
+-- pointer) = use-after-free of a Niagara/D3D12 render proxy, one root cause. MASTER
+-- kill-switch: when false, spawn_niagara/spawn_niagara_with_load spawn NOTHING. This is the
+-- decisive isolation test — if crashes stop with all client Niagara off, our VFX is the
+-- cause; re-enable selectively to pinpoint. Flip back to true after the root path is fixed.
+-- v1.0.19 2026-05-29: VFX RE-ENABLED. The team-node crash was the MC_Event "camsnap" branch
+-- (now gated below), NOT the VFX/spawns — so the master kill-switch goes back on. The per-path
+-- spawn gates remain as a one-flip kill-switch if ever needed again.
+local VFX_MASTER_ENABLED = true
+-- B-CAMSNAP 2026-05-29: THE team-node crash. Stays OFF (camera yaw-snap is cosmetic) until
+-- re-implemented safely (local pawn via _bb_get_local_pawn, delayed, no FindAllOf-remote-pawns).
+local CAMSNAP_ENABLED = false
 
 local scoreboard_visible = false
 local niagaraLib = nil
@@ -92,6 +131,7 @@ end
 -- Fast spawn: NO LoadAsset fallback (prevents game thread stalls mid-gameplay)
 -- Assets must be pre-loaded via preload_powerup_assets or already in memory
 local function spawn_niagara(world, asset_folder, asset_name, pos, rot)
+    if not VFX_MASTER_ENABLED then return nil end  -- B-RENDERUAF isolation: no client Niagara
     -- Check cached reference first (from pin phase — bypasses StaticFindObject)
     local sys = _cached_niagara_sys[asset_name]
     if not sys or not sys:IsValid() then
@@ -113,6 +153,7 @@ end
 
 -- Slow spawn: WITH LoadAsset fallback. Only use at preload time or rare one-shot events.
 local function spawn_niagara_with_load(world, asset_folder, asset_name, pos, rot)
+    if not VFX_MASTER_ENABLED then return nil end  -- B-RENDERUAF isolation: no client Niagara
     local full_path = asset_folder .. "/" .. asset_name .. "." .. asset_name
     local load_path = asset_folder .. "/" .. asset_name
     -- Check cached reference first (from pin phase)
@@ -154,11 +195,16 @@ local function despawn_niagara(comp)
     -- IsValid gate inside the pcall covers both calls. DestroyComponent is retained
     -- here only because these are arena orbs/beams removed by occasional single calls
     -- (not a tight D1 loop — that path is now deactivate-only / fire-and-forget).
+    -- B-RENDERUAF 2026-05-29: was Deactivate()+DestroyComponent(). DestroyComponent on a
+    -- Niagara comp frees its render proxy while the render thread may still use it →
+    -- D3D12Core+0x96F0 UAF (read 0xFFFF...). Every other teardown in this file was already
+    -- changed to deactivate-only for exactly this reason (B16); this shared path was the
+    -- last DestroyComponent. Deactivate() only: with bAutoDestroy=true (set on spawn) the
+    -- engine GCs the component safely on the render thread after particles finish.
     if comp then
         pcall(function()
             if comp:IsValid() then
                 comp:Deactivate()
-                comp:DestroyComponent()
             end
         end)
     end
@@ -246,6 +292,12 @@ end
 local _asset_pins = {}
 
 local function pin_niagara_assets()
+    -- B-RENDERUAF 2026-05-29: THIS was the ungated leak. It spawns Niagara "pin" components
+    -- via lib:SpawnSystemAtLocation DIRECTLY (bypassing the spawn_niagara helper gate), and
+    -- runs on class_select/preparation phase events (i.e. right after team-join). bAutoDestroy
+    -- pins retained in _asset_pins, destroyed+re-pinned on level transition = render-proxy
+    -- churn = D3D12Core+0x96F0 UAF. v1.0.13/14 gated the helpers but MISSED this direct call.
+    if not VFX_MASTER_ENABLED then return false end
     local player = FindFirstOf("BP_PlayerCharacter_C")
     if not player then return false end
     local world = player:GetWorld()
@@ -330,6 +382,7 @@ local function spawn_single_orb(index, orb_type_idx)
 end
 
 local function spawn_vent_layer(index)
+    if not VFX_MASTER_ENABLED then return end  -- B-RENDERUAF: gate ungated SpawnActor render path
     if not VENT_ENABLED then return end
     local player = FindFirstOf("BP_PlayerCharacter_C")
     if not player then print(string.format("[VFX] Powerup %d vent FAIL: no player\n", index)) return end
@@ -401,6 +454,7 @@ local function spawn_vent_layer(index)
 end
 
 local function spawn_anima_layer(index)
+    if not VFX_MASTER_ENABLED then return end  -- B-RENDERUAF: gate ungated SpawnActor render path
     if not WILD_ANIMA_ENABLED then return end
     -- Wild Anima is permanent — skip if already spawned
     if vfx_state.powerup_anima[index] then return end
@@ -613,6 +667,7 @@ end
 
 -- Spawn standing torch at flag position (colored by team)
 local function spawn_flag_torch(team)
+    if not VFX_MASTER_ENABLED then return nil end  -- B-RENDERUAF: gate ungated SpawnActor render path
     local player = FindFirstOf("BP_PlayerCharacter_C")
     if not player then return nil end
     local world = player:GetWorld()
@@ -751,6 +806,7 @@ local function register_mc_event_hook()
 
     local ok = pcall(function()
         RegisterHook("/Game/Mods/CTFScoreboard/ModActor.ModActor_C:MC_Event", function(self, event_param)
+            _htrace("MC_Event")
             _activate_wilderena()
             pcall(function()
                 local raw = nil
@@ -762,9 +818,11 @@ local function register_mc_event_hook()
                     table.insert(parts, p)
                 end
                 local etype = parts[1] or ""
+                _htrace("MC_Event:" .. etype)   -- B-HOOKTRACE: which message type arrived
 
                 ExecuteInGameThread(function()
                     pcall(function()
+                        _htrace("MC_Event:RUN:" .. etype)   -- B-HOOKTRACE: deferred dispatch ran for this etype
                         -- ======================
                         -- FLAG EVENTS
                         -- ======================
@@ -969,6 +1027,15 @@ local function register_mc_event_hook()
                             end
 
                         elseif etype == "camsnap" then
+                            -- B-CAMSNAP 2026-05-29: hook trace pinned the team-node crash to
+                            -- THIS branch (hook_current.txt = "MC_Event:RUN:camsnap"). It does
+                            -- FindAllOf("BP_PlayerCharacter_C") and calls IsLocallyControlled/
+                            -- GetController/SetControlRotation on EVERY pawn — incl. remote pawns
+                            -- mid spawn/teleport during team-join → touches a half-destroyed
+                            -- pawn = the D3D12/heap UAF. Gated OFF to confirm + stop the crash
+                            -- (camera yaw snap is cosmetic). Re-enable later via a SAFE impl
+                            -- (local pawn only via _bb_get_local_pawn, delayed so pawns settle).
+                            if not CAMSNAP_ENABLED then return end
                             -- Server asks us to snap the LOCAL player's camera to a yaw.
                             -- Must be client-side: the client owns its control rotation,
                             -- so a server SetControlRotation gets overridden. Broadcast to
@@ -1026,6 +1093,7 @@ local function register_mc_timer_hook()
 
     local ok = pcall(function()
         RegisterHook("/Game/Mods/CTFScoreboard/ModActor.ModActor_C:MC_Timer", function(self, timer_param)
+            _htrace("MC_Timer")
             _activate_wilderena()
             pcall(function()
                 local t = nil
@@ -1061,6 +1129,7 @@ local function register_mc_scoreboard_hook()
 
     local ok = pcall(function()
         RegisterHook("/Game/Mods/CTFScoreboard/ModActor.ModActor_C:MC_Scoreboard", function(self, data_param)
+            _htrace("MC_Scoreboard")
             _activate_wilderena()
             pcall(function()
                 local raw = nil
@@ -1131,6 +1200,7 @@ local function try_register_death_hook()
 
     local ok, err = pcall(function()
         RegisterHook("/Game/Gameplay/Character/Player/BP_PlayerCharacter.BP_PlayerCharacter_C:OnPlayerDeath", function(self)
+        _htrace("OnPlayerDeath")
         if not _wilderena_active then return end
         pcall(function()
             local victim = self:get()
@@ -1218,6 +1288,7 @@ local function try_register_respawn_hook()
 
     local ok, err = pcall(function()
         RegisterHook("/Script/Dominion.PlayerRespawnComponent:Multicast_Respawn", function(self, loc, rot)
+            _htrace("Multicast_Respawn")
             if not _wilderena_active then return end
             pcall(function()
                 print("[VFX] Multicast_Respawn fired\n")
@@ -1552,6 +1623,1355 @@ RegisterKeyBind(Key.NINE, function() if not WILDERENA_DEV then return end _vfx_t
 RegisterKeyBind(Key.F9, function()
     game_state.builder_allowed = not game_state.builder_allowed
     print(string.format("[WilderenaClient] builder_allowed -> %s (F9)\n", tostring(game_state.builder_allowed)))
+end)
+
+-- F4 = FXSCAN: dump every currently-LOADED NiagaraSystem matching fire/flame (with full path)
+-- to the client UE4SS.log. Run it WHEREVER you are (DowdunReach, D1, etc.) — whatever is
+-- RESIDENT there is safe to spawn there. Read-only (logs only, never spawns) so it's UNGATED
+-- (works in release builds, unlike the WILDERENA_DEV test cyclers). (Old F4 powerup-clear → F10.)
+RegisterKeyBind(Key.F4, function()
+    ExecuteInGameThread(function()
+        pcall(function()
+            local all = FindAllOf("NiagaraSystem")
+            if not all then print("[FXSCAN] no NiagaraSystem objects loaded\n"); return end
+            local n, hits = 0, 0
+            for _, sys in pairs(all) do
+                n = n + 1
+                local name = ""
+                pcall(function() name = sys:GetFullName() end)
+                local low = name:lower()
+                if low:find("fire") or low:find("flame") or low:find("ember")
+                   or low:find("burn") or low:find("lava") or low:find("magma")
+                   or low:find("campfire") or low:find("torch") or low:find("smelt")
+                   or low:find("furnace") then
+                    hits = hits + 1
+                    print(string.format("[FXSCAN] %s\n", name))
+                end
+            end
+            print(string.format("[FXSCAN] DONE: %d NiagaraSystems loaded, %d fire-like above\n", n, hits))
+        end)
+    end)
+end)
+
+-- F5 = MINIMAP-1 DIAG: dump compass widget structure + player→icon mapping so we know
+-- how to apply proximity color/visibility. Read-only — no game state mutated.
+-- (Old F5 CHUD-2 spike body left below behind _F5_PARKED_SPIKE flag; just turn flag on
+-- to reactivate it instead of this diag.)
+local _F5_PARKED_SPIKE = false
+RegisterKeyBind(Key.F5, function()
+    if not _F5_PARKED_SPIKE then
+        ExecuteInGameThread(function()
+            pcall(function()
+                print("\n[MINIMAP DIAG] ==========================================\n")
+                local compass
+                pcall(function() compass = FindFirstOf("CompassWidget") end)
+                local src = "FindFirstOf"
+                if not compass or not compass:IsValid() then
+                    pcall(function()
+                        local all = FindAllOf("CompassWidget")
+                        if all then
+                            for _, w in pairs(all) do
+                                if w and w:IsValid() then
+                                    local fn = ""; pcall(function() fn = w:GetFullName() end)
+                                    if not fn:find("Default__") then compass = w; src = "FindAllOf"; break end
+                                end
+                            end
+                        end
+                    end)
+                end
+                if not compass or not compass:IsValid() then
+                    print("[MINIMAP DIAG] compass widget: NOT RESOLVABLE\n"); return
+                end
+                print(string.format("[MINIMAP DIAG] compass: %s (via %s)\n", tostring(compass:GetFullName()), src))
+                -- Registry
+                local reg
+                pcall(function() reg = compass.GameplayObjectRegistry end)
+                if reg and reg:IsValid() then
+                    print(string.format("[MINIMAP DIAG] registry: %s\n", tostring(reg:GetFullName())))
+                    local pcs
+                    pcall(function() pcs = reg.PlayerCharacters end)
+                    if pcs then
+                        local n = 0
+                        pcall(function() n = #pcs end)
+                        print(string.format("[MINIMAP DIAG] PlayerCharacters count: %d\n", n))
+                        for i = 1, math.min(n, 6) do
+                            pcall(function()
+                                local rec = pcs[i]
+                                local name = ""; pcall(function() name = rec.OwningPlayerName:ToString() end)
+                                local loc = rec.Location
+                                print(string.format("[MINIMAP DIAG]   PC[%d] name=%s loc=(%.0f,%.0f,%.0f)\n",
+                                    i, name, loc.X or 0, loc.Y or 0, loc.Z or 0))
+                            end)
+                        end
+                    else
+                        print("[MINIMAP DIAG] PlayerCharacters: NOT ACCESSIBLE\n")
+                    end
+                else
+                    print("[MINIMAP DIAG] registry: NIL\n")
+                end
+                -- Icon map
+                local icon_map
+                pcall(function() icon_map = compass.GameplayObjectsToIcons end)
+                if icon_map then
+                    print("[MINIMAP DIAG] GameplayObjectsToIcons: accessible\n")
+                else
+                    print("[MINIMAP DIAG] GameplayObjectsToIcons: NIL — TMap may not iterate from Lua\n")
+                end
+                -- Find icons via FindAllOf as backup discovery
+                local icons
+                pcall(function() icons = FindAllOf("CompassIconWidget") end)
+                if icons then
+                    local total = 0
+                    for _ in pairs(icons) do total = total + 1 end
+                    print(string.format("[MINIMAP DIAG] FindAllOf CompassIconWidget = %d total\n", total))
+                    local shown = 0
+                    for _, ic in pairs(icons) do
+                        if shown >= 4 then break end
+                        if ic and ic:IsValid() then
+                            local fn = ""; pcall(function() fn = ic:GetFullName() end)
+                            if not fn:find("Default__") then
+                                shown = shown + 1
+                                local col_str = ""
+                                pcall(function()
+                                    local c = ic.ImageColor
+                                    col_str = string.format("(%.2f,%.2f,%.2f,%.2f)", c.R or 0, c.G or 0, c.B or 0, c.A or 0)
+                                end)
+                                print(string.format("[MINIMAP DIAG]   icon[%d]: %s color=%s\n", shown, fn, col_str))
+                            end
+                        end
+                    end
+                end
+                print("[MINIMAP DIAG] ==========================================\n\n")
+            end)
+        end)
+        return
+    end
+    ExecuteInGameThread(function()
+        pcall(function()
+            local pawns
+            pcall(function() pawns = FindAllOf("BP_PlayerCharacter_C") end)
+            if not pawns then pawns = {} end
+            local n_pawns = 0
+            -- Try to resolve UProgressBar class once outside the loop
+            local pb_class
+            pcall(function() pb_class = StaticFindObject("/Script/UMG.ProgressBar") end)
+            print(string.format("[CHUD-2 SPIKE] UProgressBar class: %s\n",
+                pb_class and tostring(pb_class:GetFullName()) or "NIL"))
+            for _, p in pairs(pawns) do
+                if not p or not p:IsValid() then goto continue end
+                local nm = ""; pcall(function() nm = p:GetFullName() end)
+                if nm:find("Default__") then goto continue end
+                n_pawns = n_pawns + 1
+                print(string.format("\n[CHUD-2 SPIKE] === pawn %d: %s ===\n", n_pawns, nm))
+                -- 1. nameplate component
+                local nc
+                pcall(function() nc = p:GetPlayerNameplateComponent() end)
+                if not nc or not nc:IsValid() then
+                    pcall(function() nc = p.PlayerNameplateComponent end)
+                end
+                if not nc or not nc:IsValid() then
+                    print("[CHUD-2 SPIKE]   nameplate comp: MISSING\n")
+                    goto continue
+                end
+                print(string.format("[CHUD-2 SPIKE]   nameplate comp: %s\n", tostring(nc:GetFullName())))
+                local w
+                pcall(function() w = nc:GetUserWidgetObject() end)
+                if not w or not w:IsValid() then pcall(function() w = nc.Widget end) end
+                if not w or not w:IsValid() then
+                    print("[CHUD-2 SPIKE]   widget instance: NOT YET RESOLVABLE\n")
+                    goto continue
+                end
+                print(string.format("[CHUD-2 SPIKE]   widget: %s\n", tostring(w:GetFullName())))
+
+                -- 1. WidgetTree
+                local wt
+                pcall(function() wt = w.WidgetTree end)
+                if not wt then print("[CHUD-2 SPIKE]   WidgetTree: nil\n"); goto continue end
+                local wt_valid = false
+                pcall(function() wt_valid = wt:IsValid() end)
+                if not wt_valid then print("[CHUD-2 SPIKE]   WidgetTree: invalid\n"); goto continue end
+                print(string.format("[CHUD-2 SPIKE]   WidgetTree: %s\n", tostring(wt:GetFullName())))
+
+                -- 2. RootWidget (the container under which the name lives)
+                local root
+                pcall(function() root = wt.RootWidget end)
+                local root_valid = false
+                if root then pcall(function() root_valid = root:IsValid() end) end
+                if not root_valid then
+                    print("[CHUD-2 SPIKE]   RootWidget: nil/invalid (need different anchor)\n")
+                    goto continue
+                end
+                local root_class_name = ""
+                pcall(function() root_class_name = root:GetClass():GetFullName() end)
+                print(string.format("[CHUD-2 SPIKE]   RootWidget: %s (class %s)\n",
+                    tostring(root:GetFullName()), root_class_name))
+
+                -- 3. Construct UProgressBar via WidgetTree:ConstructWidget(cls, name)
+                if not pb_class then
+                    print("[CHUD-2 SPIKE]   UProgressBar class missing — skip construct\n")
+                    goto continue
+                end
+                local bar
+                local construct_ok, construct_err = pcall(function()
+                    bar = wt:ConstructWidget(pb_class, "WilderenaHPBarSpike")
+                end)
+                if not construct_ok then
+                    print(string.format("[CHUD-2 SPIKE]   ConstructWidget FAILED: %s\n", tostring(construct_err)))
+                    goto continue
+                end
+                if not bar or not bar:IsValid() then
+                    print("[CHUD-2 SPIKE]   ConstructWidget returned nil/invalid\n")
+                    goto continue
+                end
+                print(string.format("[CHUD-2 SPIKE]   bar: %s\n", tostring(bar:GetFullName())))
+
+                -- 4. AddChild to the root panel
+                local add_ok, add_err, slot = pcall(function() return root:AddChild(bar) end)
+                if not add_ok then
+                    print(string.format("[CHUD-2 SPIKE]   AddChild FAILED: %s\n", tostring(add_err)))
+                    goto continue
+                end
+                print(string.format("[CHUD-2 SPIKE]   AddChild OK, slot=%s\n", tostring(add_err)))
+
+                -- 5. Set fill so we can see it
+                pcall(function() bar:SetPercent(0.7) end)
+                pcall(function() bar:SetVisibility(0) end)  -- 0=Visible
+                print("[CHUD-2 SPIKE]   Percent=0.7 + Visible — look at the nameplate\n")
+                ::continue::
+            end
+            print(string.format("\n[CHUD-2 SPIKE] DONE: %d non-default pawns processed\n", n_pawns))
+        end)
+    end)
+end)
+
+-- ============================================================================
+-- ENEMY NAMETAGS (v1.0.53) — proximity-gated red names on enemy player pawns.
+-- Tick 4 Hz, iterate all BP_PlayerCharacter pawns; for any non-local pawn within
+-- ENEMY_NAMETAG_PROXIMITY_UU, set name red + visible; otherwise collapse.
+-- "Enemy" detection: currently `non-local pawn` (stub). Team-aware filter will plug
+-- into here once we wire MC_Scoreboard parsing — search _enemy_nametag_is_enemy().
+-- Per-tick cost: FindAllOf + ~9 pawns × cheap dist + property setters = ~50 µs.
+-- ============================================================================
+-- v1.0.54: heavy optimization pass after v1.0.53 hit FPS.
+-- (a) Color: FSlateColor struct shape, not bare FLinearColor.
+-- (b) Tick 500 ms (down from 250) — proximity cue doesn't need 4 Hz.
+-- (c) Pawn list cache, 2 s refresh (FindAllOf walks all UObjects — expensive).
+-- (d) Per-pawn text-block cache (skip widget tree walk each tick).
+-- (e) Last-state cache — only call SetVisibility/SetColor when state changes.
+--     If a player stays out-of-range for 30 s, that's 1 setter call total, not 60.
+local ENEMY_NAMETAG_ENABLED = true
+local ENEMY_NAMETAG_PROXIMITY_UU = 2500
+local ENEMY_NAMETAG_PROXIMITY_SQ = ENEMY_NAMETAG_PROXIMITY_UU * ENEMY_NAMETAG_PROXIMITY_UU
+-- v1.0.56: revert v1.0.55 outline/shadow recolor (user wants the black outline preserved).
+-- Just tint the fill via SetColorAndOpacity; darken the red so it reads more solid against
+-- the black outline. Easy to tweak — drop R further for crimson, raise G/B for pink.
+local ENEMY_NAMETAG_RED_LINEAR = { R = 0.75, G = 0.0, B = 0.0, A = 1.0 }
+local ENEMY_NAMETAG_RED_SLATE = {
+    SpecifiedColor = ENEMY_NAMETAG_RED_LINEAR,
+    ColorUseRule = 0,
+}
+-- v1.0.71: CHUD-3a (nametag soft-lock glow) REVERTED — user felt buggy. Crosshair
+-- lock indicator (CHUD-3b) handles the visual feedback instead.
+
+local _ent_local_pawn = nil
+local _ent_local_pawn_check_clock = 0
+local _ent_pawn_cache = nil          -- array of {pawn, full_name, text_block}
+local _ent_pawn_cache_clock = 0
+-- key: pawn full name; value: last applied state ("vis_red" | "collapsed" | nil).
+-- Cleared on every script reload so a tuning tweak (e.g. red shade) takes effect on
+-- existing in-range enemies without requiring a state transition to redraw.
+local _ent_last_state = {}
+-- v1.0.66: track local team for switch-detection. When local player runs !blue/!red
+-- the team flips, but previously-styled enemies-who-are-now-friendlies need their
+-- nametag reset to default — and previously-styled friendlies-who-are-now-enemies
+-- need to re-enter the enemy cache. Both handled by clearing state on team change.
+local _ent_last_local_team = nil
+local ENT_NAMETAG_DEFAULT_SLATE = {
+    SpecifiedColor = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 },
+    ColorUseRule = 0,
+}
+-- v1.0.58: one-time nametag scale. key: pawn full name; value: true once we've
+-- applied the SetRenderScale on its text block. Friendlies + enemies BOTH get
+-- shrunk for uniform UI. Render-scale path avoids touching the font (which would
+-- reset the outline we want preserved). Adjust knob below for size.
+local NAMETAG_SCALE = 0.70  -- 30% smaller; bump to 0.65 for OSRS-tight, 0.80 for milder
+local _ent_scaled = {}
+local _ent_tick_count = 0
+local _ent_last_log = 0
+
+local function _ent_resolve_local_pawn()
+    -- re-resolve only if cached one is gone/invalid (every ~4 s tops via check_clock)
+    if _ent_local_pawn then
+        local ok = false
+        pcall(function() ok = _ent_local_pawn:IsValid() end)
+        if ok then return _ent_local_pawn end
+    end
+    local now = os.clock()
+    if (now - _ent_local_pawn_check_clock) < 1.0 then return nil end  -- backoff during fail
+    _ent_local_pawn_check_clock = now
+    local pc
+    pcall(function() pc = FindFirstOf("PlayerController") end)
+    if not pc or not pc:IsValid() then return nil end
+    local pawn
+    pcall(function() pawn = pc.Pawn end)
+    if not pawn or not pawn:IsValid() then pcall(function() pawn = pc:K2_GetPawn() end) end
+    if not pawn or not pawn:IsValid() then return nil end
+    _ent_local_pawn = pawn
+    return pawn
+end
+
+-- One-shot resolve: for a given pawn, fetch its nameplate text-block. Returns nil if not yet
+-- resolvable. Called from cache rebuild only; the per-tick path uses the cached value.
+local function _ent_resolve_text_block(pawn)
+    local nc
+    pcall(function() nc = pawn:GetPlayerNameplateComponent() end)
+    if not nc or not nc:IsValid() then pcall(function() nc = pawn.PlayerNameplateComponent end) end
+    if not nc or not nc:IsValid() then return nil end
+    local w
+    pcall(function() w = nc:GetUserWidgetObject() end)
+    if not w or not w:IsValid() then pcall(function() w = nc.Widget end) end
+    if not w or not w:IsValid() then return nil end
+    local txt
+    pcall(function() txt = w.PlayerNameTextBlock end)
+    if not txt or not txt:IsValid() then return nil end
+    return txt
+end
+
+-- Resolve pawn → display name via its controller's PlayerState. Same pattern the
+-- existing refresh_player_cache uses (line ~752) — known to work.
+local function _ent_pawn_player_name(pawn)
+    local name = ""
+    pcall(function()
+        local ctrl = pawn:GetInstigatorController()
+        if ctrl and ctrl:IsValid() then
+            local ps = ctrl.PlayerState
+            if ps and ps:IsValid() then
+                local n = ps:GetPlayerName()
+                if n then name = n:ToString() or "" end
+            end
+        end
+    end)
+    return name
+end
+
+-- Resolve player name → team via game_state.players (populated by the MC_Scoreboard
+-- hook). Slots 1-3 = red, slots 4-6 = blue. Returns nil if name not found in the
+-- scoreboard yet (late-joining player, scoreboard hasn't arrived).
+local function _ent_team_for_name(player_name)
+    if not player_name or player_name == "" then return nil end
+    if not game_state or not game_state.players then return nil end
+    for slot = 1, 6 do
+        local rec = game_state.players[slot]
+        if rec and rec.name == player_name then
+            return (slot <= 3) and "red" or "blue"
+        end
+    end
+    return nil
+end
+
+-- Rebuild the pawn cache. Iterates BP_PlayerCharacter once and stores (pawn, name,
+-- text_block) so per-tick we skip FindAllOf + widget tree walks entirely.
+-- v1.0.57: team-aware filter — only include enemies (opposite team) in the cache.
+-- Local team resolved from MC_Scoreboard. If LOCAL team can't be determined yet (no
+-- scoreboard, or local player not in roster), fall back to "all non-local = enemy".
+local function _ent_rebuild_pawn_cache(local_pawn)
+    local local_name_full = ""; pcall(function() local_name_full = local_pawn:GetFullName() end)
+    local local_player_name = _ent_pawn_player_name(local_pawn)
+    local local_team = _ent_team_for_name(local_player_name)
+    -- v1.0.66: team-switch cleanup. If local team changed (e.g. !blue/!red), every
+    -- previously-styled pawn could now be on the OTHER side of the friend/enemy
+    -- split. Reset every non-local nametag to default + nuke state cache; the rest
+    -- of this rebuild + next tick re-applies the correct styling.
+    if _ent_last_local_team ~= nil and local_team ~= nil and _ent_last_local_team ~= local_team then
+        print(string.format("[NAMETAG] local team switched %s -> %s; resetting all\n",
+            tostring(_ent_last_local_team), tostring(local_team)))
+        local all_pawns
+        pcall(function() all_pawns = FindAllOf("BP_PlayerCharacter_C") end)
+        if all_pawns then
+            for _, rp in pairs(all_pawns) do
+                if rp and rp:IsValid() then
+                    local rn = ""; pcall(function() rn = rp:GetFullName() end)
+                    if rn ~= "" and not rn:find("Default__") and rn ~= local_name_full then
+                        local rt = _ent_resolve_text_block(rp)
+                        if rt then
+                            pcall(function() rt:SetColorAndOpacity(ENT_NAMETAG_DEFAULT_SLATE) end)
+                            pcall(function() rt:SetVisibility(0) end)
+                        end
+                    end
+                end
+            end
+        end
+        _ent_last_state = {}
+    end
+    _ent_last_local_team = local_team or _ent_last_local_team
+    local pawns
+    pcall(function() pawns = FindAllOf("BP_PlayerCharacter_C") end)
+    if not pawns then _ent_pawn_cache = {}; return end
+    local new_cache = {}
+    for _, p in pairs(pawns) do
+        if not p or not p:IsValid() then goto next_p end
+        local pn = ""; pcall(function() pn = p:GetFullName() end)
+        if pn == "" or pn:find("Default__") then goto next_p end
+        if pn == local_name_full then goto next_p end
+        -- Resolve text up front (cheap if cached); needed for scale-once even if we skip cache
+        local txt = _ent_resolve_text_block(p)
+        if not txt then goto next_p end
+        -- v1.0.58: scale once per pawn, friendlies AND enemies, so the whole match feels
+        -- consistent. RenderScale acts on the inner UWidget transform — doesn't touch
+        -- font/outline/color. Idempotent + cheap, but we still gate on _ent_scaled.
+        if not _ent_scaled[pn] then
+            pcall(function() txt:SetRenderScale({ X = NAMETAG_SCALE, Y = NAMETAG_SCALE }) end)
+            _ent_scaled[pn] = true
+        end
+        -- Team filter — decide whether this pawn enters the enemy cache (recolor target)
+        if local_team then
+            local player_name = _ent_pawn_player_name(p)
+            local pawn_team = _ent_team_for_name(player_name)
+            if pawn_team and pawn_team == local_team then goto next_p end  -- friendly: keep default
+        end
+        table.insert(new_cache, { pawn = p, name = pn, text = txt })
+        ::next_p::
+    end
+    _ent_pawn_cache = new_cache
+end
+
+local function _ent_tick()
+    if not ENEMY_NAMETAG_ENABLED then return end
+    _ent_tick_count = _ent_tick_count + 1
+    local lp = _ent_resolve_local_pawn()
+    if not lp then return end
+    local lp_loc
+    pcall(function() lp_loc = lp:K2_GetActorLocation() end)
+    if not lp_loc then return end
+    -- Rebuild pawn cache every 2 s
+    local now = os.clock()
+    if not _ent_pawn_cache or (now - _ent_pawn_cache_clock) > 2.0 then
+        _ent_rebuild_pawn_cache(lp)
+        _ent_pawn_cache_clock = now
+    end
+    local in_range, out_of_range, setters_fired = 0, 0, 0
+    for _, entry in ipairs(_ent_pawn_cache) do
+        local p_loc
+        pcall(function() p_loc = entry.pawn:K2_GetActorLocation() end)
+        if not p_loc then goto next_e end
+        local dx, dy, dz = p_loc.X - lp_loc.X, p_loc.Y - lp_loc.Y, p_loc.Z - lp_loc.Z
+        local dsq = dx*dx + dy*dy + dz*dz
+        local desired = (dsq <= ENEMY_NAMETAG_PROXIMITY_SQ) and "vis_red" or "collapsed"
+        if desired == "vis_red" then in_range = in_range + 1 else out_of_range = out_of_range + 1 end
+        if _ent_last_state[entry.name] ~= desired then
+            if desired == "vis_red" then
+                pcall(function() entry.text:SetColorAndOpacity(ENEMY_NAMETAG_RED_SLATE) end)
+                pcall(function() entry.text:SetVisibility(0) end)
+            else
+                pcall(function() entry.text:SetVisibility(1) end)
+            end
+            _ent_last_state[entry.name] = desired
+            setters_fired = setters_fired + 1
+        end
+        ::next_e::
+    end
+    if (now - _ent_last_log) > 30 then
+        _ent_last_log = now
+        print(string.format("[NAMETAG] ticks=%d cached=%d in_range=%d out=%d setters_fired_this_tick=%d\n",
+            _ent_tick_count, #_ent_pawn_cache, in_range, out_of_range, setters_fired))
+    end
+end
+
+-- v1.0.67: bumped to 750 ms — proximity cue doesn't need 2 Hz; halves base load.
+LoopAsync(750, function()
+    ExecuteInGameThread(function() pcall(_ent_tick) end)
+    return false
+end)
+
+-- ============================================================================
+-- MINIMAP-1 (v1.0.60): proximity + red recolor of enemy compass icons.
+-- Same 25 m radius as nametag. Friendlies untouched. Within range → tint icon
+-- image red + visible; out of range → collapse icon.
+-- Lookup chain (per diag v1.0.59): WBP_HUD_Compass_C.GameplayObjectRegistry
+--   .PlayerCharacters[i].{OwningPlayerName, Location, Identifier} → compass
+--   .GameplayObjectsToIcons[Identifier] = UCompassIconWidget.
+-- Per-tick: 1 K2_GetActorLocation + 1 TArray walk (≤9) + per-player TMap lookup
+-- + state-cache gate. Setters fire only on transitions.
+-- ============================================================================
+local MINIMAP_ENABLED = true
+local _mm_compass = nil
+local _mm_compass_check_clock = 0
+local _mm_last_state = {}  -- key: player name; value: "red" | "hide"
+local _mm_last_log = 0
+local _mm_tick_count = 0
+
+local function _mm_find_compass()
+    if _mm_compass then
+        local ok = false; pcall(function() ok = _mm_compass:IsValid() end)
+        if ok then return _mm_compass end
+        _mm_compass = nil
+    end
+    local now = os.clock()
+    if (now - _mm_compass_check_clock) < 1.0 then return nil end
+    _mm_compass_check_clock = now
+    local c
+    pcall(function() c = FindFirstOf("CompassWidget") end)
+    if not c or not c:IsValid() then
+        pcall(function()
+            local all = FindAllOf("CompassWidget")
+            if all then
+                for _, w in pairs(all) do
+                    if w and w:IsValid() then
+                        local fn = ""; pcall(function() fn = w:GetFullName() end)
+                        if not fn:find("Default__") then c = w; break end
+                    end
+                end
+            end
+        end)
+    end
+    if c and c:IsValid() then _mm_compass = c end
+    return _mm_compass
+end
+
+-- v1.0.64: precomputed colors. Out-of-range uses alpha=0 transparent
+-- (SetVisibility was being overridden by the compass's per-frame icon refresh,
+-- so we tint the IconImage's alpha instead — the compass doesn't reset color).
+local MINIMAP_RED_VISIBLE  = { R = 0.75, G = 0.0, B = 0.0, A = 1.0 }
+local MINIMAP_TRANSPARENT  = { R = 0.0, G = 0.0, B = 0.0, A = 0.0 }
+local MINIMAP_DEFAULT_TINT = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
+local _mm_last_local_team = nil  -- for team-switch reset (matches nametag pattern)
+
+local function _mm_tick()
+    if not MINIMAP_ENABLED then return end
+    _mm_tick_count = _mm_tick_count + 1
+    local lp = _ent_resolve_local_pawn()
+    if not lp then return end
+    local lp_loc; pcall(function() lp_loc = lp:K2_GetActorLocation() end)
+    if not lp_loc then return end
+    local compass = _mm_find_compass()
+    if not compass then return end
+    local reg; pcall(function() reg = compass.GameplayObjectRegistry end)
+    if not reg or not reg:IsValid() then return end
+    local pcs; pcall(function() pcs = reg.PlayerCharacters end)
+    if not pcs then return end
+    local icon_map; pcall(function() icon_map = compass.GameplayObjectsToIcons end)
+    if not icon_map then return end
+    local loop_ok, loop_err = pcall(function()
+    local local_player_name = _ent_pawn_player_name(lp)
+    local local_team = _ent_team_for_name(local_player_name)
+    -- v1.0.66: team-switch reset for minimap. When local team flips, every PC's icon
+    -- could be on the wrong side of the friend/enemy split. Reset all to default
+    -- alpha; next tick re-applies enemy tint for new enemies (and leaves new
+    -- friendlies untouched, which means they stay default = correct).
+    if _mm_last_local_team ~= nil and local_team ~= nil and _mm_last_local_team ~= local_team then
+        print(string.format("[MINIMAP] local team switched %s -> %s; resetting all icon tints\n",
+            tostring(_mm_last_local_team), tostring(local_team)))
+        pcall(function()
+            local nn = 0; pcall(function() nn = #pcs end)
+            for i = 1, nn do
+                local rec = pcs[i]; if not rec then goto next_r end
+                local guid = rec.Identifier; if not guid then goto next_r end
+                local raw, icon
+                pcall(function() raw = icon_map:Find(guid) end)
+                if raw then pcall(function() icon = raw:get() end) end
+                if icon then
+                    local ok = false; pcall(function() ok = icon:IsValid() end)
+                    if ok then pcall(function() icon.IconImage:SetColorAndOpacity(MINIMAP_DEFAULT_TINT) end) end
+                end
+                ::next_r::
+            end
+        end)
+    end
+    _mm_last_local_team = local_team or _mm_last_local_team
+    local n = 0; pcall(function() n = #pcs end)
+    local in_range, hidden = 0, 0
+    for i = 1, n do
+        local rec = pcs[i]
+        if not rec then goto next_p end
+        local name = ""
+        pcall(function() name = rec.OwningPlayerName:ToString() end)
+        if name == "" or name == local_player_name then goto next_p end
+        if local_team then
+            local pawn_team = _ent_team_for_name(name)
+            if pawn_team and pawn_team == local_team then goto next_p end
+        end
+        local loc = rec.Location
+        if not loc then goto next_p end
+        local dx = loc.X - lp_loc.X
+        local dy = loc.Y - lp_loc.Y
+        local dz = loc.Z - lp_loc.Z
+        local dsq = dx*dx + dy*dy + dz*dz
+        -- TMap lookup: :Find returns RemoteUnrealParam; :get() unwraps to UCompassIconWidget.
+        local icon_raw, icon
+        local guid = rec.Identifier
+        if not guid then goto next_p end
+        pcall(function() icon_raw = icon_map:Find(guid) end)
+        if icon_raw then pcall(function() icon = icon_raw:get() end) end
+        if not icon then
+            local raw2; pcall(function() raw2 = icon_map[guid] end)
+            if raw2 then pcall(function() icon = raw2:get() end); if not icon then icon = raw2 end end
+        end
+        local icon_ok = false
+        if icon then pcall(function() icon_ok = icon:IsValid() end) end
+        if not icon_ok then goto next_p end
+        -- v1.0.64: ALWAYS apply the tint per tick (no state cache). Compass rewrites
+        -- visibility every frame as part of its directional update, so SetVisibility
+        -- gets overridden; tint via IconImage's alpha instead.
+        if dsq <= ENEMY_NAMETAG_PROXIMITY_SQ then
+            in_range = in_range + 1
+            pcall(function() icon.IconImage:SetColorAndOpacity(MINIMAP_RED_VISIBLE) end)
+        else
+            hidden = hidden + 1
+            pcall(function() icon.IconImage:SetColorAndOpacity(MINIMAP_TRANSPARENT) end)
+        end
+        ::next_p::
+    end
+    end)
+    if not loop_ok then print(string.format("[MINIMAP] LOOP ERR: %s\n", tostring(loop_err))) end
+    if (os.clock() - _mm_last_log) > 30 then
+        _mm_last_log = os.clock()
+        print(string.format("[MINIMAP] ticks=%d in_range=%d hidden=%d\n",
+            _mm_tick_count, in_range, hidden))
+    end
+end
+
+-- v1.0.67: staggered 600 ms (offset from nametag's 750 ms so tick boundaries don't
+-- collide every cycle). Minimap proximity gating doesn't need sub-second latency.
+LoopAsync(600, function()
+    ExecuteInGameThread(function() pcall(_mm_tick) end)
+    return false
+end)
+
+-- v1.0.75 CHUD-3 PARKED. Lock-on / crosshair / TrainingDummy proxy code removed.
+-- See project_chud3_parked_2026_05_30 memory + PLAN_CHUD3_LOCKON.md in HarenaDamage
+-- source for cold-start handoff. F6 reflection diag, F7 force-assign crash, F11 TD
+-- verify, F12 proxy spawn, and crosshair boot diag all preserved in git history
+-- (v1.0.73-74). The keybinds + boot-time diag below are deleted but flagged false
+-- for reference. To resume CHUD-3: revert the block deletion in v1.0.74 main.lua.
+if false then  -- BEGIN parked CHUD-3 block
+RegisterKeyBind(Key.F7, function()
+    ExecuteInGameThread(function()
+        pcall(function()
+            print("\n[LOCKON SPIKE F7] ==========================================\n")
+            local lp = _ent_resolve_local_pawn()
+            if not lp then print("[F7] no local pawn\n"); return end
+            local loc
+            pcall(function() loc = lp:GetLockOnTargetingComponent() end)
+            if not loc or not loc:IsValid() then pcall(function() loc = lp.LockOnTargetingComponent end) end
+            if not loc or not loc:IsValid() then print("[F7] no lock-on comp\n"); return end
+            -- Probe current target's class first
+            local ct
+            pcall(function() ct = loc.CurrentTarget end)
+            print(string.format("[F7] BEFORE: CurrentTarget=%s\n", tostring(ct)))
+            if ct then
+                local cn = ""; pcall(function() cn = ct:GetClass():GetFullName() end)
+                local fn = ""; pcall(function() fn = ct:GetFullName() end)
+                print(string.format("[F7] current target class=%s\n", cn))
+                print(string.format("[F7] current target obj  =%s\n", fn))
+            end
+            -- Find closest enemy in cache
+            local target_pawn = nil
+            if _ent_pawn_cache then
+                local lp_loc; pcall(function() lp_loc = lp:K2_GetActorLocation() end)
+                local best_dsq = math.huge
+                for _, e in ipairs(_ent_pawn_cache) do
+                    local pl; pcall(function() pl = e.pawn:K2_GetActorLocation() end)
+                    if pl and lp_loc then
+                        local dx, dy, dz = pl.X - lp_loc.X, pl.Y - lp_loc.Y, pl.Z - lp_loc.Z
+                        local d = dx*dx + dy*dy + dz*dz
+                        if d < best_dsq then best_dsq = d; target_pawn = e.pawn end
+                    end
+                end
+            end
+            if not target_pawn then print("[F7] no enemy in cache\n"); return end
+            local tn = ""; pcall(function() tn = target_pawn:GetFullName() end)
+            print(string.format("[F7] target pawn = %s\n", tn))
+            -- THE ATTEMPT
+            print("[F7] >>> assigning CurrentTarget = target_pawn (next frame native tick MAY crash)\n")
+            local set_ok, set_err = pcall(function() loc.CurrentTarget = target_pawn end)
+            print(string.format("[F7] set result: ok=%s err=%s\n", tostring(set_ok), tostring(set_err)))
+            -- Readback
+            local rd
+            pcall(function() rd = loc.CurrentTarget end)
+            print(string.format("[F7] AFTER: CurrentTarget=%s\n", tostring(rd)))
+            print("[LOCKON SPIKE F7] ========================================== — survived this tick; native crash (if any) on next frame\n\n")
+        end)
+    end)
+end)
+
+-- v1.0.72 CHUD-3 P3 LOCKON_DIAG: runtime reflection to discover lock-on internals
+-- (UClass + interface + implementers + vtable shape). Skips Ghidra entirely. F6.
+RegisterKeyBind(Key.F6, function()
+    ExecuteInGameThread(function()
+        pcall(function()
+            print("\n[LOCKON DIAG] ==========================================\n")
+            -- 1. Find the interface UClass
+            local iface
+            pcall(function() iface = StaticFindObject("/Script/Dominion.LockOnTargetingInterface") end)
+            print(string.format("[LOCKON DIAG] interface UClass: %s\n",
+                iface and tostring(iface:GetFullName()) or "NIL"))
+            -- 2. Find the lock-on component UClass
+            local comp_cls
+            pcall(function() comp_cls = StaticFindObject("/Script/Dominion.LockOnTargetingComponent") end)
+            print(string.format("[LOCKON DIAG] component UClass: %s\n",
+                comp_cls and tostring(comp_cls:GetFullName()) or "NIL"))
+            -- 3. Find the local player's lock-on component instance
+            local lp = _ent_resolve_local_pawn()
+            if lp then
+                local loc
+                pcall(function() loc = lp:GetLockOnTargetingComponent() end)
+                if not loc or not loc:IsValid() then pcall(function() loc = lp.LockOnTargetingComponent end) end
+                print(string.format("[LOCKON DIAG] local lock-on comp: %s\n",
+                    (loc and loc:IsValid()) and tostring(loc:GetFullName()) or "NIL"))
+                if loc and loc:IsValid() then
+                    local ct
+                    pcall(function() ct = loc.CurrentTarget end)
+                    print(string.format("[LOCKON DIAG]   CurrentTarget: %s\n", tostring(ct)))
+                    for _, prop in ipairs({"TraceRadius","TraceDistance","MaxTargetDistance",
+                                           "SphereOverlapRadius","ScreenSpaceAngleTolerance",
+                                           "PlayerCharacter","PlayerController","LockOnCameraActor",
+                                           "TargetingWidgetInstance","LockOnTargetingIconWidgetClass"}) do
+                        local v
+                        pcall(function() v = loc[prop] end)
+                        print(string.format("[LOCKON DIAG]   .%s = %s\n", prop, tostring(v)))
+                    end
+                end
+            end
+            -- 4. Find all instances implementing the interface (FindAllOf on interface class)
+            if iface then
+                local impls
+                pcall(function() impls = FindAllOf("LockOnTargetingInterface") end)
+                if impls then
+                    local seen_classes = {}
+                    local n = 0
+                    for _, o in pairs(impls) do
+                        if o and o:IsValid() then
+                            local cn = ""
+                            pcall(function() cn = o:GetClass():GetFullName() end)
+                            if cn ~= "" and not seen_classes[cn] then
+                                seen_classes[cn] = true
+                                n = n + 1
+                                if n <= 15 then print("[LOCKON DIAG]   implementer class: " .. cn .. "\n") end
+                            end
+                        end
+                    end
+                    print(string.format("[LOCKON DIAG] %d distinct implementer classes found\n", n))
+                else
+                    print("[LOCKON DIAG] FindAllOf(LockOnTargetingInterface) returned nil\n")
+                end
+            end
+            -- 5. Try to enumerate interface's UFunction children (its 3 methods)
+            if iface then
+                local fns = {}
+                pcall(function()
+                    iface:ForEachChild(function(child)
+                        if child:GetClass():GetFName():ToString():find("Function") then
+                            table.insert(fns, child:GetFullName())
+                        end
+                        return LoopAction.Continue
+                    end)
+                end)
+                if #fns > 0 then
+                    for _, fn in ipairs(fns) do print("[LOCKON DIAG]   iface function: " .. fn .. "\n") end
+                else
+                    print("[LOCKON DIAG]   (couldn't enumerate iface functions via ForEachChild)\n")
+                end
+            end
+            print("[LOCKON DIAG] ==========================================\n\n")
+        end)
+    end)
+end)
+
+-- v1.0.74 CHUD-3 P3 — TrainingDummy interface verification (F11). Phase 1
+-- decided to go A′ (borrow existing implementer). Before spawning a proxy we need
+-- to confirm BP_AI_TrainingDummy_Character_C actually implements ILockOnTargetingInterface.
+-- Tries StaticFindObject by candidate paths, then live-instance fallback, then walks
+-- the class's Interfaces TArray. Reports YES/NO + super + sibling interfaces.
+RegisterKeyBind(Key.F11, function()
+    ExecuteInGameThread(function()
+        pcall(function()
+            print("\n[TD VERIFY] ==========================================\n")
+            local iface
+            pcall(function() iface = StaticFindObject("/Script/Dominion.LockOnTargetingInterface") end)
+            print(string.format("[TD VERIFY] iface = %s\n",
+                (iface and iface:IsValid()) and tostring(iface:GetFullName()) or "NIL"))
+
+            -- Try several candidate paths for the TrainingDummy UClass
+            local td_cls
+            local candidates = {
+                "BP_AI_TrainingDummy_Character_C",
+                "/Game/AI/TrainingDummy/BP_AI_TrainingDummy_Character.BP_AI_TrainingDummy_Character_C",
+                "/Game/Characters/AI/TrainingDummy/BP_AI_TrainingDummy_Character.BP_AI_TrainingDummy_Character_C",
+                "/Game/Dragonwilds/AI/TrainingDummy/BP_AI_TrainingDummy_Character.BP_AI_TrainingDummy_Character_C",
+            }
+            for _, p in ipairs(candidates) do
+                local got
+                pcall(function() got = StaticFindObject(p) end)
+                if got and got:IsValid() then
+                    td_cls = got
+                    print(string.format("[TD VERIFY] class via StaticFindObject(%s)\n  -> %s\n",
+                        p, tostring(td_cls:GetFullName())))
+                    break
+                end
+            end
+            -- Fallback: any live instance in world
+            if not td_cls or not td_cls:IsValid() then
+                local inst
+                pcall(function() inst = FindFirstOf("BP_AI_TrainingDummy_Character_C") end)
+                if inst and inst:IsValid() then
+                    pcall(function() td_cls = inst:GetClass() end)
+                    if td_cls and td_cls:IsValid() then
+                        print(string.format("[TD VERIFY] class via live instance\n  -> %s\n",
+                            tostring(td_cls:GetFullName())))
+                    end
+                else
+                    print("[TD VERIFY] FindFirstOf(BP_AI_TrainingDummy_Character_C) returned NIL — no live dummy in world\n")
+                end
+            end
+            if not td_cls or not td_cls:IsValid() then
+                print("[TD VERIFY] FAIL: cannot resolve TrainingDummy UClass. Spawn one nearby and retry F11.\n")
+                print("[TD VERIFY] ==========================================\n\n")
+                return
+            end
+
+            -- Walk class's Interfaces TArray
+            local impls_lockon = false
+            local impls_count = 0
+            pcall(function()
+                local ifaces = td_cls.Interfaces
+                if ifaces then
+                    for i = 1, #ifaces do
+                        local fi = ifaces[i]
+                        local ic = fi and fi.Class
+                        if ic and ic:IsValid() then
+                            impls_count = impls_count + 1
+                            local nm = ic:GetFullName()
+                            print("[TD VERIFY]   iface[" .. i .. "] = " .. tostring(nm) .. "\n")
+                            if iface and ic == iface then impls_lockon = true end
+                            if nm and nm:find("LockOnTargetingInterface") then impls_lockon = true end
+                        end
+                    end
+                else
+                    print("[TD VERIFY]   .Interfaces is nil — Lua may not expose this property\n")
+                end
+            end)
+            print(string.format("[TD VERIFY] Interfaces TArray entries: %d\n", impls_count))
+
+            -- Probe via live instance: try calling the interface UFunctions directly
+            local inst2
+            pcall(function() inst2 = FindFirstOf("BP_AI_TrainingDummy_Character_C") end)
+            if inst2 and inst2:IsValid() then
+                for _, fname in ipairs({"CanTarget", "GetPosition", "GetTargetingIconPosition"}) do
+                    local ok, res = pcall(function() return inst2[fname](inst2) end)
+                    print(string.format("[TD VERIFY]   live:%s() ok=%s res=%s\n",
+                        fname, tostring(ok), tostring(res)))
+                end
+            else
+                print("[TD VERIFY]   (no live instance to probe UFunctions on)\n")
+            end
+
+            -- Super chain — sanity check
+            local cur = td_cls
+            local depth = 0
+            while cur and cur:IsValid() and depth < 6 do
+                print(string.format("[TD VERIFY]   super[%d] = %s\n", depth, tostring(cur:GetFullName())))
+                local nxt
+                pcall(function() nxt = cur:GetSuperStruct() end)
+                if not nxt or not nxt:IsValid() or nxt == cur then break end
+                cur = nxt
+                depth = depth + 1
+            end
+
+            print(string.format("[TD VERIFY] >>>>> implements LockOnTargetingInterface? %s <<<<<\n",
+                tostring(impls_lockon)))
+            print("[TD VERIFY] ==========================================\n\n")
+        end)
+    end)
+end)
+
+-- v1.0.74 CHUD-3 P3 — proxy spawn + CurrentTarget spike (F12). Phase A′ path:
+-- borrow existing native implementer (TrainingDummy) as a hidden, no-tick, no-collision
+-- proxy actor. Spawn one near the local player, sync to nearest enemy pawn, assign as
+-- LockOnTargetingComponent.CurrentTarget. Survives next tick = engine accepted it.
+-- Crashes next tick = approach is dead (treat as Vol-B confirm of F7's failure mode).
+-- IMPORTANT: run F11 first to verify TrainingDummy implements the interface. If
+-- verification fails, change PROXY_CLASS_CANDIDATES below to a confirmed implementer.
+local _chud3_proxy = nil  -- last spawned proxy (so repeated F12 destroys+respawns)
+local PROXY_CLASS_CANDIDATES = {
+    "BP_AI_TrainingDummy_Character_C",
+    "/Game/AI/TrainingDummy/BP_AI_TrainingDummy_Character.BP_AI_TrainingDummy_Character_C",
+    "/Game/Characters/AI/TrainingDummy/BP_AI_TrainingDummy_Character.BP_AI_TrainingDummy_Character_C",
+}
+local function _chud3_resolve_proxy_class()
+    for _, p in ipairs(PROXY_CLASS_CANDIDATES) do
+        local cls
+        pcall(function() cls = StaticFindObject(p) end)
+        if cls and cls:IsValid() then return cls, p end
+    end
+    -- Fallback: any live instance
+    local inst
+    pcall(function() inst = FindFirstOf("BP_AI_TrainingDummy_Character_C") end)
+    if inst and inst:IsValid() then
+        local cls
+        pcall(function() cls = inst:GetClass() end)
+        if cls and cls:IsValid() then return cls, "live-instance" end
+    end
+    return nil, nil
+end
+local function _chud3_pick_enemy_pawn(local_pawn)
+    -- Prefer an enemy from the nametag cache (already team-filtered).
+    -- Fallback: any BP_PlayerCharacter_C other than local.
+    local best, best_dist = nil, math.huge
+    local lp_loc
+    pcall(function() lp_loc = local_pawn:K2_GetActorLocation() end)
+    if _ent_pawn_cache then
+        for _, e in ipairs(_ent_pawn_cache) do
+            if e.pawn and e.pawn:IsValid() and e.pawn ~= local_pawn then
+                local loc
+                pcall(function() loc = e.pawn:K2_GetActorLocation() end)
+                if loc and lp_loc then
+                    local dx, dy, dz = loc.X - lp_loc.X, loc.Y - lp_loc.Y, loc.Z - lp_loc.Z
+                    local d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < best_dist then best_dist = d2; best = e.pawn end
+                end
+            end
+        end
+    end
+    if best then return best end
+    local pawns
+    pcall(function() pawns = FindAllOf("BP_PlayerCharacter_C") end)
+    if pawns then
+        for _, p in pairs(pawns) do
+            if p and p:IsValid() and p ~= local_pawn then
+                local loc
+                pcall(function() loc = p:K2_GetActorLocation() end)
+                if loc and lp_loc then
+                    local dx, dy, dz = loc.X - lp_loc.X, loc.Y - lp_loc.Y, loc.Z - lp_loc.Z
+                    local d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < best_dist then best_dist = d2; best = p end
+                end
+            end
+        end
+    end
+    return best
+end
+RegisterKeyBind(Key.F12, function()
+    ExecuteInGameThread(function()
+        pcall(function()
+            print("\n[P3 SPIKE F12] ==========================================\n")
+            -- Cleanup any previous proxy first
+            if _chud3_proxy and _chud3_proxy:IsValid() then
+                print("[P3] destroying previous proxy\n")
+                pcall(function() _chud3_proxy:K2_DestroyActor() end)
+                _chud3_proxy = nil
+            end
+            local lp = _ent_resolve_local_pawn()
+            if not lp then print("[P3] FAIL: no local pawn\n"); return end
+            local enemy = _chud3_pick_enemy_pawn(lp)
+            if not enemy then
+                print("[P3] FAIL: no enemy pawn in cache or world\n"); return
+            end
+            local en_name = ""; pcall(function() en_name = enemy:GetFullName() end)
+            print("[P3] target enemy: " .. en_name .. "\n")
+            local cls, via = _chud3_resolve_proxy_class()
+            if not cls then
+                print("[P3] FAIL: cannot resolve TrainingDummy UClass (run F11 first to find a working path)\n")
+                return
+            end
+            print(string.format("[P3] proxy class via %s: %s\n", via, tostring(cls:GetFullName())))
+            local world; pcall(function() world = lp:GetWorld() end)
+            if not world then print("[P3] FAIL: no world\n"); return end
+            local en_loc; pcall(function() en_loc = enemy:K2_GetActorLocation() end)
+            if not en_loc then print("[P3] FAIL: enemy has no location\n"); return end
+            local proxy
+            local sok, serr = pcall(function() proxy = world:SpawnActor(cls, en_loc, {}) end)
+            if not sok or not proxy or not proxy:IsValid() then
+                print(string.format("[P3] FAIL: SpawnActor ok=%s err=%s proxy=%s\n",
+                    tostring(sok), tostring(serr), tostring(proxy)))
+                return
+            end
+            _chud3_proxy = proxy
+            local pn = ""; pcall(function() pn = proxy:GetFullName() end)
+            print("[P3] spawned proxy: " .. pn .. "\n")
+            -- Configure: hidden, no tick, no collision
+            pcall(function() proxy:SetActorHiddenInGame(true) end)
+            pcall(function() proxy:SetActorTickEnabled(false) end)
+            pcall(function() proxy:SetActorEnableCollision(false) end)
+            print("[P3] configured: hidden + no-tick + no-collision\n")
+            -- Unpossess any AI controller it auto-spawned
+            pcall(function()
+                local ctrl = proxy:GetController()
+                if ctrl and ctrl:IsValid() then
+                    print("[P3] proxy got controller " .. tostring(ctrl:GetFullName()) .. " — destroying it\n")
+                    pcall(function() ctrl:K2_DestroyActor() end)
+                end
+            end)
+            -- Probe interface methods on the proxy itself
+            for _, fname in ipairs({"CanTarget","GetPosition","GetTargetingIconPosition"}) do
+                local ok, res = pcall(function() return proxy[fname](proxy) end)
+                print(string.format("[P3]   proxy:%s() ok=%s res=%s\n", fname, tostring(ok), tostring(res)))
+            end
+            -- Get local lock-on component
+            local loc
+            pcall(function() loc = lp:GetLockOnTargetingComponent() end)
+            if not loc or not loc:IsValid() then
+                pcall(function() loc = lp.LockOnTargetingComponent end)
+            end
+            if not loc or not loc:IsValid() then
+                print("[P3] FAIL: no lock-on component on local pawn\n"); return
+            end
+            print("[P3] lock-on comp resolved: " .. tostring(loc:GetFullName()) .. "\n")
+            local before
+            pcall(function() before = loc.CurrentTarget end)
+            print("[P3]   CurrentTarget before: " .. tostring(before) .. "\n")
+            print("[P3] >>> assigning CurrentTarget = proxy  (next frame native tick = moment of truth)\n")
+            local aok, aerr = pcall(function() loc.CurrentTarget = proxy end)
+            print(string.format("[P3]   assign ok=%s err=%s\n", tostring(aok), tostring(aerr)))
+            local after
+            pcall(function() after = loc.CurrentTarget end)
+            print("[P3]   CurrentTarget after:  " .. tostring(after) .. "\n")
+            print("[P3 SPIKE F12] survived this tick — watch for reticle, watch for crash next frame\n")
+            print("[P3 SPIKE F12] ==========================================\n\n")
+        end)
+    end)
+end)
+
+-- v1.0.71 CHUD-3b — native crosshair tint. The game has UReticleWidgetBase with
+-- a switcher containing per-context UReticleWidget instances (Default/Magic/etc).
+-- Each has a UImage* Crosshair. We tint the active one red when aim cone contains
+-- an enemy, white otherwise. Diag boot-pass first (find + dump), tick wires later.
+local CHUD3_CROSSHAIR_ENABLED = true
+local CHUD3_AIM_CONE_DOT = 0.97   -- ~14° cone — tight, "you're aiming right at them"
+local _cx_diag_done = false
+local function _cx_diag_once()
+    if _cx_diag_done then return end
+    print("\n[CHUD-3b DIAG] ==========================================\n")
+    local bases
+    pcall(function() bases = FindAllOf("ReticleWidgetBase") end)
+    if not bases then print("[CHUD-3b DIAG] no ReticleWidgetBase instances\n"); return end
+    local n = 0
+    for _, b in pairs(bases) do
+        if b and b:IsValid() then
+            local fn = ""; pcall(function() fn = b:GetFullName() end)
+            if not fn:find("Default__") then
+                n = n + 1
+                print(string.format("[CHUD-3b DIAG] base[%d]: %s\n", n, fn))
+                for _, sub_name in ipairs({"ReticleDefault","ReticleStealth","ReticleRangedADS",
+                                           "ReticleMagic","ReticleRepair","ReticleAimedUtilityMagic",
+                                           "ReticleEquippedContainer","AdditiveReticleHuntersSense"}) do
+                    local sub; pcall(function() sub = b[sub_name] end)
+                    if sub then
+                        local sn = ""; pcall(function() sn = sub:GetFullName() end)
+                        local valid = false; pcall(function() valid = sub:IsValid() end)
+                        if valid and sn ~= "" then
+                            local cx; pcall(function() cx = sub.Crosshair end)
+                            local cxn = ""; if cx then pcall(function() cxn = cx:GetFullName() end) end
+                            print(string.format("[CHUD-3b DIAG]   %s -> %s  Crosshair=%s\n",
+                                sub_name, sn, cxn))
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if n == 0 then print("[CHUD-3b DIAG] no non-default ReticleWidgetBase found\n") end
+    print("[CHUD-3b DIAG] ==========================================\n\n")
+    _cx_diag_done = true
+end
+-- Defer until HUD has spawned (~5-8 s after world load)
+ExecuteWithDelay(8000, function() ExecuteInGameThread(_cx_diag_once) end)
+LoopAsync(5000, function() if not _cx_diag_done then ExecuteInGameThread(_cx_diag_once) end; return false end)
+end  -- END parked CHUD-3 block (v1.0.75: if false then ...)
+
+-- v1.0.65: also kill the 4 edge MarkerStack corners (where off-screen icons render
+-- when you turn 180° away from an enemy) AND hide bed icons AND collapse the
+-- per-icon distance readouts (the "X m" text above/below each marker). The
+-- MarkerStack_* corners are SetVisibility(Collapsed) one-shot per compass; bed
+-- icon alpha + distance-overlay collapse run per-tick so they survive compass
+-- re-renders. Distance-overlay collapse is cached per-icon to avoid repeat work.
+local _mm_stacks_done_for = nil
+local _mm_dist_collapsed = {}  -- key: icon FullName; value: true once collapsed
+local _mm_dist_scan_last = 0   -- backoff for FindAllOf("CompassIconWidget")
+local function _mm_kill_corners_and_beds_tick()
+    local compass = _mm_find_compass()
+    if not compass then return end
+    local fn = ""; pcall(function() fn = compass:GetFullName() end)
+    -- Corners: one-shot per compass instance (re-run on respawn / new HUD widget)
+    if _mm_stacks_done_for ~= fn then
+        for _, slot in ipairs({ "MarkerStack_UpperLeft", "MarkerStack_UpperRight",
+                                "MarkerStack_LowerLeft", "MarkerStack_LowerRight" }) do
+            pcall(function()
+                local box = compass[slot]
+                if box and box:IsValid() then box:SetVisibility(1) end  -- Collapsed
+            end)
+        end
+        _mm_stacks_done_for = fn
+    end
+    -- Beds: per-tick alpha=0 (same reason as player icons — compass re-renders)
+    local reg; pcall(function() reg = compass.GameplayObjectRegistry end)
+    if not reg or not reg:IsValid() then return end
+    local beds; pcall(function() beds = reg.Beds end)
+    if not beds then return end
+    local icon_map; pcall(function() icon_map = compass.GameplayObjectsToIcons end)
+    if not icon_map then return end
+    local n = 0; pcall(function() n = #beds end)
+    pcall(function()
+        for i = 1, n do
+            local rec = beds[i]
+            if not rec then goto next_b end
+            local guid = rec.Identifier
+            if not guid then goto next_b end
+            local raw, icon
+            pcall(function() raw = icon_map:Find(guid) end)
+            if raw then pcall(function() icon = raw:get() end) end
+            if not icon then goto next_b end
+            local ok = false; pcall(function() ok = icon:IsValid() end)
+            if not ok then goto next_b end
+            pcall(function() icon.IconImage:SetColorAndOpacity(MINIMAP_TRANSPARENT) end)
+            ::next_b::
+        end
+    end)
+    -- v1.0.67: Distance overlays — only FindAllOf("CompassIconWidget") at most every
+    -- 3 s instead of every 500 ms. Walking the global UObject array is the main jitter
+    -- source. Per-icon collapse is still one-shot via _mm_dist_collapsed.
+    local now2 = os.clock()
+    if (now2 - _mm_dist_scan_last) > 3.0 then
+        _mm_dist_scan_last = now2
+        pcall(function()
+            local icons = FindAllOf("CompassIconWidget")
+            if not icons then return end
+            for _, ic in pairs(icons) do
+                if ic and ic:IsValid() then
+                    local fn = ""; pcall(function() fn = ic:GetFullName() end)
+                    if fn ~= "" and not fn:find("Default__") and not _mm_dist_collapsed[fn] then
+                        pcall(function() ic.DistanceAboveOverlay:SetVisibility(1) end)
+                        pcall(function() ic.DistanceBelowOverlay:SetVisibility(1) end)
+                        pcall(function() ic.DistanceAboveText:SetVisibility(1) end)
+                        pcall(function() ic.DistanceBelowText:SetVisibility(1) end)
+                        _mm_dist_collapsed[fn] = true
+                    end
+                end
+            end
+        end)
+    end
+end
+
+-- v1.0.67: 1500 ms — corners are one-shot per compass instance; bed alpha is
+-- idempotent and 1.5 s of bed visibility on respawn is fine. Distance-overlay
+-- collapse internally backs off to 3 s. Heaviest of the three ticks, so slowest.
+LoopAsync(1500, function()
+    ExecuteInGameThread(function() pcall(_mm_kill_corners_and_beds_tick) end)
+    return false
+end)
+
+-- ============================================================================
+-- CHUD-1: HITSPLATS ON PLAYERS (v1.0.35)
+-- Mob hits show floating damage numbers via UDamageFloatiesSubsystem, gated
+-- per-DamageComponent by bShowDamageFloaties — players ship with it OFF. Enable
+-- it on every player's PlayerDamageComponent so PvP hits show RS-style hitsplats.
+-- Client-side, respawn-safe via a slow loop. Flag-gated for instant disable.
+-- (Property set + SetCanShowDamageFloaties belt-and-suspenders; both pcall'd.)
+-- ============================================================================
+-- v1.0.37: drop the flag-flip (confirmed not the gate for PvP). Real path: hook the player's
+-- OnDamageReceivedDynamic_Event, and on each hit call UDamageFloatiesSubsystem:DisplayDamage
+-- (float, FVector) directly using the event's Amount + VictimLocation. The subsystem renders
+-- a floaty at that location locally — works for any visible damaged player.
+local COMBAT_HUD_HITSPLATS = true
+-- v1.0.49: Option N parked. CHUD_COMPARE_MODE=false reverts to single-floaty default
+-- (DisplayDamage / UFloatingDamageWidget). The compare-mode plumbing + TextWidgetClass CDO
+-- patch attempt stays in code as documented dead paths — flip true to revive the side-by-side
+-- spawn or to revisit Option N (DisplayText + red text-widget) later.
+local CHUD_COMPARE_MODE = false
+local _chud_floaties_sub = nil
+local _chud_hook_registered = false
+local _chud_floaty_count = 0
+local _chud_text_count = 0
+local _chud_text_cdo_patched = false
+local _chud_last_log = 0
+
+-- v1.0.38 diagnostic: log every hook fire + each failure step to pinpoint where it stops.
+local _chud_hit_seq = 0
+local function _chud_log_hit(tag, msg)
+    print(string.format("[CHUD-1 HIT#%d] %s %s\n", _chud_hit_seq, tag, msg or ""))
+end
+
+local function _chud_find_subsystem()
+    -- UWorldSubsystem instances aren't reliably FindFirstOf-discoverable (same trap as
+    -- TeleportationSubsystem); try multiple lookups and report which one worked.
+    local s
+    pcall(function() s = FindFirstOf("DamageFloatiesSubsystem") end)
+    if s and s:IsValid() then return s, "FindFirstOf" end
+    local all
+    pcall(function() all = FindAllOf("DamageFloatiesSubsystem") end)
+    if all then
+        for _, o in pairs(all) do
+            local n = ""; pcall(function() n = o:GetFullName() end)
+            if o and o:IsValid() and not n:find("Default__") then return o, "FindAllOf" end
+        end
+    end
+    return nil, "NONE"
+end
+
+-- v1.0.41: local-pawn lookup so we can skip splats when WE are the victim.
+-- Hook is class-level on BP_PlayerCharacter, so it fires on every player instance
+-- (us getting hit + the opponent we hit). User wants splats only on opponent.
+local function _chud_local_pawn()
+    local pc
+    pcall(function() pc = FindFirstOf("PlayerController") end)
+    if not pc or not pc:IsValid() then
+        pcall(function()
+            local all = FindAllOf("PlayerController")
+            if all then
+                for _, c in pairs(all) do
+                    local n = ""; pcall(function() n = c:GetFullName() end)
+                    if c and c:IsValid() and not n:find("Default__") then
+                        local is_local = false
+                        pcall(function() is_local = c:IsLocalController() end)
+                        if is_local then pc = c; break end
+                    end
+                end
+            end
+        end)
+    end
+    if not pc or not pc:IsValid() then return nil end
+    local pawn
+    pcall(function() pawn = pc.Pawn end)
+    if not pawn or not pawn:IsValid() then
+        pcall(function() pawn = pc:K2_GetPawn() end)
+    end
+    return pawn
+end
+
+local function _chud_register_hitsplat_hook()
+    if _chud_hook_registered then return end
+    pcall(function()
+        -- v1.0.40: delegate sig is (Target: AActor*, DamageEvent: FDominionDamageEvent), so
+        -- the callback needs THREE args (self + 2 delegate params). v1.0.39 was treating Target
+        -- as the damage event — that's why :get() returned an AActor and .Amount was a UObject.
+        RegisterHook("/Game/Gameplay/Character/Player/BP_PlayerCharacter.BP_PlayerCharacter_C:OnDamageReceivedDynamic_Event",
+            function(self, target_param, damage_event_param)
+                if not COMBAT_HUD_HITSPLATS then return end
+                _chud_hit_seq = _chud_hit_seq + 1
+                _chud_log_hit("ENTER")
+                -- v1.0.44: REVERTED skip-self. The hook only fires on the victim's owning
+                -- client (so when WE get hit, OUR client sees the event; when we hit someone,
+                -- THEIR client sees it). There's no way to make this fire attacker-side
+                -- without a server multicast — user is OK with self-floaties for now.
+                local sub, src = _chud_find_subsystem()
+                if not sub then _chud_log_hit("NO_SUB"); return end
+                if _chud_hit_seq <= 3 then _chud_log_hit("SUB_OK", "via " .. src) end
+                -- v1.0.39: wrap everything after SUB_OK in a pcall that logs the error —
+                -- UE4SS hook handlers swallow Lua errors silently, which masked the failure.
+                -- Also probe damage_event_param multiple ways (type, :get(), direct field).
+                local rest_ok, rest_err = pcall(function()
+                    if _chud_hit_seq <= 2 then
+                        _chud_log_hit("DEP_TYPE", type(damage_event_param) ..
+                            " nil=" .. tostring(damage_event_param == nil))
+                    end
+                    local de_via_get
+                    local g_ok, g_err = pcall(function() de_via_get = damage_event_param:get() end)
+                    if _chud_hit_seq <= 2 then
+                        _chud_log_hit("GET", string.format("ok=%s val=%s err=%s",
+                            tostring(g_ok), tostring(de_via_get), tostring(g_err)))
+                    end
+                    local amt_direct, amt_get
+                    pcall(function() amt_direct = damage_event_param.Amount end)
+                    if de_via_get then pcall(function() amt_get = de_via_get.Amount end) end
+                    if _chud_hit_seq <= 2 then
+                        _chud_log_hit("AMT",
+                            string.format("direct=%s get=%s", tostring(amt_direct), tostring(amt_get)))
+                    end
+                    local amt = (amt_get and amt_get > 0) and amt_get or amt_direct
+                    if not amt or amt <= 0 then
+                        _chud_log_hit("BAD_AMT", "final=" .. tostring(amt)); return
+                    end
+                    local vloc
+                    if de_via_get then pcall(function() vloc = de_via_get.VictimLocation end) end
+                    if not vloc then pcall(function() vloc = damage_event_param.VictimLocation end) end
+                    if not vloc then _chud_log_hit("NO_VLOC"); return end
+                    local pos = { X = vloc.X, Y = vloc.Y, Z = vloc.Z + 150 }
+                    local call_ok, call_err = pcall(function() sub:DisplayDamage(amt, pos) end)
+                    if call_ok then
+                        _chud_floaty_count = _chud_floaty_count + 1
+                        _chud_log_hit("DISPLAYED",
+                            string.format("amt=%.1f at (%.0f,%.0f,%.0f)", amt, pos.X, pos.Y, pos.Z))
+                    else
+                        _chud_log_hit("CALL_FAIL", tostring(call_err))
+                    end
+                    -- v1.0.48: Option N compare path. Fire DisplayText right next to the
+                    -- damage floaty so user can compare side-by-side. Different widget class
+                    -- (UFloatingTextWidget vs UFloatingDamageWidget) — different animation +
+                    -- separately CDO-patched color.
+                    if CHUD_COMPARE_MODE then
+                        local pos_n = { X = pos.X + 60, Y = pos.Y + 60, Z = pos.Z }
+                        local txt_ok, txt_err = pcall(function()
+                            sub:DisplayText(FText(string.format("%d", math.floor(amt))), pos_n)
+                        end)
+                        if txt_ok then
+                            _chud_text_count = _chud_text_count + 1
+                            if _chud_hit_seq <= 3 then _chud_log_hit("DTXT_OK", "Option N spawned") end
+                        else
+                            if _chud_hit_seq <= 3 then _chud_log_hit("DTXT_FAIL", tostring(txt_err)) end
+                        end
+                    end
+                end)
+                if not rest_ok then _chud_log_hit("REST_ERR", tostring(rest_err)) end
+            end)
+        _chud_hook_registered = true
+        print("[CHUD-1] OnDamageReceivedDynamic hook registered (DisplayDamage path)\n")
+    end)
+    -- v1.0.47: pool-warmup. The native floaty subsystem lazily instantiates its first
+    -- UFloatingDamageWidget on the very first DisplayDamage call (~1 frame alloc + Slate
+    -- prepass), which is why the first PvP hit shows no splat. Warm the pool once: deep
+    -- underground so the widget (if briefly visible) renders off-camera. Subsequent calls
+    -- reuse the pooled widget — first real hit now appears instantly.
+    pcall(function()
+        local sub = _chud_find_subsystem()
+        if sub then
+            sub:DisplayDamage(1.0, { X = 0, Y = 0, Z = -1000000 })
+            print("[CHUD-1] pool-warmup fired\n")
+            -- v1.0.48: Option N — patch UFloatingTextWidget CDO color to red. One-time at boot,
+            -- zero per-hit cost. TextWidgetClass is the separate native widget used by
+            -- DisplayText (and natively by resource pickups). Patching here means our
+            -- DisplayText calls render in red but native PvE resource floaties also do
+            -- (acceptable since PvE resource floaties are rare during PvP combat).
+            pcall(function()
+                if _chud_text_cdo_patched then return end
+                local tw_class
+                pcall(function() tw_class = sub.TextWidgetClass end)
+                if not tw_class then print("[CHUD-1] N: TextWidgetClass nil\n"); return end
+                local cdo
+                pcall(function() cdo = tw_class:GetDefaultObject() end)
+                if not cdo or not cdo:IsValid() then
+                    pcall(function() cdo = tw_class.ClassDefaultObject end)
+                end
+                if not cdo or not cdo:IsValid() then print("[CHUD-1] N: CDO not resolvable\n"); return end
+                -- warmup the text pool too so first DisplayText doesn't drop
+                pcall(function() sub:DisplayText(FText("0"), { X=0, Y=0, Z=-1000000 }) end)
+                -- Try both SetColorAndOpacity shapes
+                local red_slate = { SpecifiedColor = {R=1,G=0,B=0,A=1}, ColorUseRule = 0 }
+                local set_ok = false
+                pcall(function()
+                    local t = cdo.FloatieText
+                    if t and t:IsValid() then
+                        t:SetColorAndOpacity(red_slate); set_ok = true
+                    end
+                end)
+                _chud_text_cdo_patched = true
+                print(string.format("[CHUD-1] N: TextWidget CDO color patch attempted set_ok=%s\n",
+                    tostring(set_ok)))
+            end)
+        else
+            print("[CHUD-1] pool-warmup SKIPPED — subsystem not yet resident\n")
+        end
+    end)
+end
+
+-- defer reg so BP class is loaded; retry every 10s until success, and log status periodically
+ExecuteWithDelay(3000, function() ExecuteInGameThread(_chud_register_hitsplat_hook) end)
+LoopAsync(10000, function()
+    if not _chud_hook_registered then ExecuteInGameThread(_chud_register_hitsplat_hook) end
+    if (os.clock() - _chud_last_log) > 30 then
+        _chud_last_log = os.clock()
+        print(string.format("[CHUD-1] hook=%s floaties_shown=%d\n",
+            _chud_hook_registered and "ON" or "OFF", _chud_floaty_count))
+    end
+    return false
 end)
 
 -- F3 = Test spawn red + blue standing torches at flag positions
@@ -1958,8 +3378,8 @@ RegisterKeyBind(Key.F8, function()
     end)
 end)
 
--- F4 = Clear ALL powerup objects (test + existing world objects)
-RegisterKeyBind(Key.F4, function()
+-- F10 = Clear ALL powerup objects (test + existing world objects). Moved from F4 (now FXSCAN).
+RegisterKeyBind(Key.F10, function()
     if not _wilderena_active then return end
     ExecuteInGameThread(function()
         pcall(function()
@@ -2417,8 +3837,15 @@ local _abyss_fire_comps = {}  -- spawned NiagaraComponents (for despawn)
 local _abyss_nia_systems = {}  -- cached system refs (loaded once)
 
 local function _abyss_load_systems()
-    if _abyss_nia_systems.big then return true end
+    -- v1.0.23: was `if _abyss_nia_systems.big then return true` — non-nil ONLY, so a STALE
+    -- ref (GC'd / level transition) returned "loaded" and the spawn crashed on it. Now require
+    -- IsValid; if stale, fall through and re-LoadAsset + re-resolve.
+    if _abyss_nia_systems.big and _abyss_nia_systems.big:IsValid() then return true end
     local paths = {
+        -- v1.0.33: back to the REAL big fire NS_Fire_Big_2. It crashed before via the OLD spawn
+        -- mechanism (nflib + bAutoDestroy=false + SetEmitterEnable) — now the proven path
+        -- (get_niagara_lib + bAutoDestroy=true) is confirmed crash-free (fireplace), so retry it.
+        -- If it crashes, the asset itself is broken → revert to the fireplace.
         big = "/Game/Marketplace/Realistic_Pack/Niagara/Fire/NS_Fire_Big_2.NS_Fire_Big_2",
         fs  = "/Game/Art/VFX/Library/Spells/FireSpirit/NS_FireSpirit_Playful.NS_FireSpirit_Playful",
         i1  = "/Game/Art/VFX/Library/Combat/Magic/Fire/Attack_01/NS_Attack_Fire_Magic_01_Impact.NS_Attack_Fire_Magic_01_Impact",
@@ -2445,10 +3872,29 @@ end
 -- null-deref on TP (UE4SS.dll+0x248EA1) BEFORE our fire even spawned. false = the abyss
 -- AND DFX polls both no-op, so NOTHING of ours runs in D1. If entry STILL crashes ->
 -- it's the engine/game/teleport, NOT our mod. If it stops -> re-enable pieces 1 at a time.
-local D1_CLIENT_VFX_ENABLED = false
--- B56: spawn ONLY the middle fire @scale 10 (was 3x @14); keep ambient OFF.
-local ABYSS_BIG_FIRE_ENABLED = true    -- middle fire, scale 10 (moot while D1 disabled)
+-- v1.0.21 2026-05-29: REVERTED to false. Re-enabling (v1.0.20) brought back a REAL abyss-entry
+-- crash: UE4SS.dll+0x3370F6 null-deref (read 0x0) during the D1 abyss/DFX Niagara spawn — the
+-- ORIGINAL abyss crash (B55), SEPARATE from camsnap (which was the team-node crash, fixed
+-- v1.0.18). So the dungeon/abyss VFX has a genuine spawn-time null-deref (likely a Niagara
+-- SYSTEM not resident → SpawnSystemAtLocation on a null/invalid system). Needs a real fix
+-- (asset residency / null-guard the spawn), NOT just this flag. OFF keeps clients stable.
+-- v1.0.22 2026-05-29: DFX (per-dungeon fog + node orbs) RE-ENABLED — proven safe (D2/D3 ran
+-- the exact same DFX code with ZERO crashes). The abyss-entry crash is D1-ONLY = the abyss
+-- BIG FIRE spawn (NS_Fire_Big_2). So DFX on, big-fire OFF, + null-guard on the fire spawn.
+local D1_CLIENT_VFX_ENABLED = true
+-- D1-only abyss-entry crasher: SpawnSystemAtLocation on a non-resident NS_Fire_Big_2 =
+-- native UE4SS null-deref (pcall can't catch). OFF until the fire asset residency is fixed.
+-- v1.0.26 2026-05-29: CONFIRMED — scale 1 ALSO froze the client. So NS_Fire_Big_2 is broken
+-- at ANY scale (the asset itself, not size). Disabled for good. Central D1 flame, if wanted,
+-- must use a different RESIDENT fire system (NS_Mana_Build_Loop_Fire — the node-orb fire).
+-- v1.0.31: RE-ENABLED via the proven get_niagara_lib path (see _activate_abyss_fires). The
+-- crash was the old nflib+bAutoDestroy=false+SetEmitterEnable mechanism, not the asset.
+local ABYSS_BIG_FIRE_ENABLED = true    -- proven-path spawn, NS_Fire_Fireplace @10x
 local ABYSS_AMBIENT_ENABLED  = false   -- wisps + fire-explosions stay OFF (load)
+-- v1.0.32: Z offset from the floor coord for the big fires. Was -500 → buried them under the
+-- floor (coords ARE floor level) = invisible. 0 = at floor (visible baseline); tune as needed.
+local ABYSS_FIRE_Z_OFFSET = 0
+local ABYSS_FIRE_SCALE = 14   -- tunable uniform scale for the 3 big fires
 
 local function _activate_abyss_fires()
     if not (ABYSS_BIG_FIRE_ENABLED or ABYSS_AMBIENT_ENABLED) then return end
@@ -2466,28 +3912,34 @@ local function _activate_abyss_fires()
 
     local count = 0
     _abyss_fire_comps = {}
-    -- B56: ONE fire (the middle coord) at scale 10, not 3 at 14 (~80% less load) to
-    -- dodge the engine-cluster entry crash while keeping a centerpiece flame.
+    -- v1.0.31 2026-05-30: spawn the 3 fires through the PROVEN orb/DFX mechanism — the old
+    -- abyss path (nflib + bAutoDestroy=FALSE + post-spawn SetEmitterEnable) crashed at
+    -- UE4SS.dll+0x248EA1 regardless of asset/scale/residency. This uses get_niagara_lib() +
+    -- bAutoDestroy=TRUE and NO SetEmitterEnable (exactly what the node orbs use crash-free).
+    -- 3 fires @scale 10 (10x the asset's natural size), positioned 500 units BELOW the floor
+    -- coords per user. Null-guard retained (native-crash protection if the system is invalid).
     if ABYSS_BIG_FIRE_ENABLED then
         local big_sys = _abyss_nia_systems.big
-        local mid = abyss_fire_coords[2]  -- middle of the 3 floor positions
-        pcall(function()
-            local f = nflib:SpawnSystemAtLocation(world, big_sys, mid, {Pitch=0,Yaw=0,Roll=0}, {X=10,Y=10,Z=10}, false, true, 0, false)
-            if f then
-                count = count + 1
-                table.insert(_abyss_fire_comps, f)
-                -- B56 best-effort cull (smoke / spawn-rate). Names are guesses for the
-                -- marketplace asset; pcall makes a miss a harmless no-op. True smoke
-                -- removal needs the NS_Fire_Big_2 asset edited + the .pak repackaged.
-                pcall(function() f:SetEmitterEnable("Smoke", false) end)
-                pcall(function() f:SetEmitterEnable("smoke", false) end)
-                pcall(function() f:SetVariableFloat("User.SmokeAmount", 0.0) end)
-                pcall(function() f:SetVariableFloat("User.SpawnRateScale", 0.5) end)
+        if not (big_sys and big_sys:IsValid()) then
+            print("[WilderenaClient] Abyss Fire: big_sys nil/invalid — skip (no crash)\n")
+            return
+        end
+        local lib = get_niagara_lib()
+        if not lib then print("[WilderenaClient] Abyss Fire: niagara lib nil — skip\n"); return end
+        for i = 1, 3 do
+            local c = abyss_fire_coords[i]
+            if c then
+                local pos = {X = c.X, Y = c.Y, Z = c.Z + ABYSS_FIRE_Z_OFFSET}   -- tune height via the offset
+                pcall(function()
+                    local f = lib:SpawnSystemAtLocation(world, big_sys, pos,
+                        {Pitch=0,Yaw=0,Roll=0}, {X=ABYSS_FIRE_SCALE,Y=ABYSS_FIRE_SCALE,Z=ABYSS_FIRE_SCALE}, true, true, 0, false)
+                    if f then count = count + 1; table.insert(_abyss_fire_comps, f) end
+                end)
             end
-        end)
+        end
     end
     _abyss_active = true
-    print(string.format("[WilderenaClient] Abyss Fire Zone: ACTIVATED (middle-only %d fire @x10, ambient=%s)\n", count, tostring(ABYSS_AMBIENT_ENABLED)))
+    print(string.format("[WilderenaClient] Abyss Fire Zone: ACTIVATED (%d fires @x10, -500Z, proven path, ambient=%s)\n", count, tostring(ABYSS_AMBIENT_ENABLED)))
 end
 
 -- Ambient ring buffer + tracker MUST be declared BEFORE _deactivate_abyss_fires
@@ -2694,6 +4146,7 @@ end)
 -- (no authored perimeter) -- tune c/rsq/zlo/zhi if fog/markers land wrong.
 -- ============================================================================
 local function _d2_spawn(world, pkg, pos, scale)   -- scaled niagara spawn (also used by key 6)
+    if not VFX_MASTER_ENABLED then return nil end  -- B-RENDERUAF: gate direct Niagara spawn
     local name = pkg:match("/([^/]+)$")
     local full = pkg .. "." .. name
     local sys = _cached_niagara_sys[name]
@@ -2713,7 +4166,7 @@ end
 local MANA = "/Game/Art/VFX/Library/Spells/ManaBuild/NS_Mana_Build_Loop_"
 local DFX = {
     [1] = { c = {X=16341,Y=186600}, zlo=-2700, zhi=-1000, rsq=3800*3800,
-            gate = {X=17640,Y=185280,Z=-1392}, gfx=MANA.."Fire",   gs=2.5, fog="light" },
+            gate = {X=17640,Y=185280,Z=-1392}, gfx=MANA.."Fire",   gs=2.5, fog="light", fog_ext=1.5 },
     [2] = { c = {X=6553,Y=187511},  zlo=-99999, zhi=-2700, rsq=3500*3500,
             gate = {X=8148,Y=185855,Z=-3124},  gfx=MANA.."Nature", gs=1.25, fog="swamp",
             boss = {X=4958,Y=189167,Z=-3516} },
@@ -2745,7 +4198,9 @@ local function _dfx_spawn_fog(world, d)
             pcall(function() comp:SetHeightFogFalloff(0.5) end)
             pcall(function() comp:SetFogAlbedo({ R = 0.42, G = 0.5, B = 0.4, A = 1.0 }) end)
         else
-            pcall(function() comp:SetHeightFogExtinction(0.4) end)
+            -- v1.0.23: per-dungeon extinction override (d.fog_ext). D1 now denser (1.5) per
+            -- user; D3 keeps the light default (0.4) since it has no fog_ext.
+            pcall(function() comp:SetHeightFogExtinction(d.fog_ext or 0.4) end)
             pcall(function() comp:SetHeightFogFalloff(0.8) end)
             pcall(function() comp:SetFogAlbedo({ R = 0.7, G = 0.72, B = 0.78, A = 1.0 }) end)
         end
